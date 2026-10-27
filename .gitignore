@@ -1,0 +1,12 @@
+__pycache__/
+Data/
+*.egg-info/
+.env
+.env.*
+.venv/
+tools/Messanger/whatsapp/BaileysServer/node_modules/
+tools/Messanger/whatsapp/BaileysServer/package-lock.json
+tools/Messanger/whatsapp/BaileysServer/package.json
+tools/Messanger/whatsapp/BaileysServer/qr_code.png
+*.log
+Data/SessionCookies/
