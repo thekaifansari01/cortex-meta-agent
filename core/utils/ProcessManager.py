@@ -17,6 +17,7 @@ class SubprocessManager:
         return cls._instance
     
     def spawn(self, args, **kwargs) -> Optional[subprocess.Popen]:
+        self._children = [p for p in self._children if p.poll() is None]
         if platform.system() == 'Windows':
             kwargs['creationflags'] = subprocess.CREATE_NEW_PROCESS_GROUP
         else:
