@@ -25,15 +25,11 @@ class CustomProvider(BaseLLMProvider):
         self.model = model or CUSTOM_MODEL or "default-model"
         self.thinking_enabled = thinking_enabled if thinking_enabled is not None else CUSTOM_THINKING_ENABLED
         
-        self._converted_tools_cache = None
         logger.info(f"✅ CustomProvider initialized | Endpoint: {self.base_url} | Model: {self.model}")
     
     def _convert_tools_to_openai(self, tools_list: List[Any]) -> List[Dict[str, Any]]:
         if not tools_list:
             return []
-        
-        if self._converted_tools_cache is not None:
-            return self._converted_tools_cache
         
         openai_tools = []
         
@@ -97,7 +93,6 @@ class CustomProvider(BaseLLMProvider):
                             }
                         })
             
-            self._converted_tools_cache = openai_tools
             return openai_tools
             
         except Exception as e:
