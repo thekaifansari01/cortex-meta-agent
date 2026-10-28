@@ -40,7 +40,6 @@ class BastenProviderMeta(BaseLLMProvider):
         if not self.api_key:
             raise ValueError("BASTEN_API_KEY not found in config")
 
-        self._converted_tools_cache = None
         logger.info(
             f"🦙 Basten Meta provider initialized | Endpoint: {self.base_url} | Model: {self.model}"
         )
@@ -48,9 +47,6 @@ class BastenProviderMeta(BaseLLMProvider):
     def _convert_tools_to_openai(self, tools_list: List[Any]) -> List[Dict[str, Any]]:
         if not tools_list:
             return []
-
-        if self._converted_tools_cache is not None:
-            return self._converted_tools_cache
 
         openai_tools = []
 
@@ -125,7 +121,6 @@ class BastenProviderMeta(BaseLLMProvider):
                             }
                         )
 
-            self._converted_tools_cache = openai_tools
             return openai_tools
 
         except Exception as e:
