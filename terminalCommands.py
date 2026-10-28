@@ -38,20 +38,29 @@ def _is_pid_active_cortex(pid: int) -> bool:
     if pid <= 0 or pid == os.getpid():
         return False
 
+    main_script_norm = os.path.join(PROJECT_ROOT, "main.py").lower().replace("\\", "/")
+
     try:
         import psutil
-        if not psutil.pid_exists(pid):
-            return False
-        proc = psutil.Process(pid)
-        if proc.status() == psutil.STATUS_ZOMBIE:
-            return False
-        name = (proc.name() or "").lower()
-        cmdline = " ".join(proc.cmdline() or []).lower()
-        return any(k in name or k in cmdline for k in ("python", "cortex"))
     except ImportError:
-        pass
-    except Exception:
-        return False
+        psutil = None
+
+    if psutil is not None:
+        try:
+            if not psutil.pid_exists(pid):
+                return False
+            proc = psutil.Process(pid)
+            if proc.status() == psutil.STATUS_ZOMBIE:
+                return False
+            try:
+                cmdline = " ".join(proc.cmdline() or [])
+            except (psutil.AccessDenied, psutil.NoSuchProcess):
+                return True
+            if not cmdline:
+                return True
+            return main_script_norm in cmdline.lower().replace("\\", "/")
+        except Exception:
+            return True
 
     if platform.system() == "Windows":
         try:
@@ -63,17 +72,27 @@ def _is_pid_active_cortex(pid: int) -> bool:
                 text=True,
                 timeout=5,
             ).lower()
-            if str(pid) in output and ("python" in output or "cortex" in output):
-                return True
-            return False
+            if not output.strip() or "no tasks" in output:
+                return False
+            return f'"{pid}"' in output and "python" in output
         except Exception:
             return False
-    else:
-        try:
-            os.kill(pid, 0)
-            return True
-        except OSError:
-            return False
+
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+
+    try:
+        proc_path = f"/proc/{pid}/cmdline"
+        if os.path.exists(proc_path):
+            with open(proc_path, "rb") as f:
+                raw = f.read().replace(b"\x00", b" ").decode("utf-8", errors="replace")
+            return main_script_norm in raw.lower().replace("\\", "/")
+    except Exception:
+        return True
+
+    return True
 
 
 def is_cortex_running() -> bool:
