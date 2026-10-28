@@ -74,18 +74,16 @@ def get_console_hwnd():
     global _console_hwnd
     if platform.system() != "Windows":
         return None
-    if _console_hwnd and ctypes.windll.user32.IsWindow(_console_hwnd):
-        return _console_hwnd
     try:
-        kernel32 = ctypes.windll.kernel32
         user32 = ctypes.windll.user32
+        if _console_hwnd and user32.IsWindow(_console_hwnd):
+            return _console_hwnd
+        kernel32 = ctypes.windll.kernel32
         hwnd = kernel32.GetConsoleWindow()
-        if not hwnd or not user32.IsWindowVisible(hwnd):
-            fg_hwnd = user32.GetForegroundWindow()
-            if fg_hwnd:
-                hwnd = fg_hwnd
-        _console_hwnd = hwnd
-        return hwnd
+        if hwnd and user32.IsWindow(hwnd):
+            _console_hwnd = hwnd
+            return hwnd
+        return None
     except Exception:
         return None
 
