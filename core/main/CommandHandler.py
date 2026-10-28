@@ -45,6 +45,11 @@ def main_command_processor(command: str, executor: ThreadPoolExecutor, memory: C
             source, len(raw), line_count, preview
         )
 
+        try:
+            memory.add_message("USER", raw)
+        except Exception as exc:
+            logging.error("Memory update failed (USER): %s", exc, exc_info=True)
+
         result = process_command(raw, memory_instance=memory)
 
         if is_shutting_down():
@@ -96,14 +101,13 @@ def main_command_processor(command: str, executor: ThreadPoolExecutor, memory: C
                 }
 
         try:
-            memory.add_message("USER", raw)
             memory.add_message(
                 "CORTEX",
                 result.get("response", ""),
                 metadata=metadata if metadata else None,
             )
         except Exception as exc:
-            logging.error("Memory update failed: %s", exc, exc_info=True)
+            logging.error("Memory update failed (CORTEX): %s", exc, exc_info=True)
 
         if result.get("response"):
             time.sleep(0.1)
