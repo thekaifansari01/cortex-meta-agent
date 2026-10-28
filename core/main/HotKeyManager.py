@@ -11,6 +11,7 @@ from core.brain.Memory.Memory import ContextMemory
 from core.main.CommandHandler import main_command_processor, is_cortex_busy
 
 _is_popup_open = False
+_popup_lock = threading.Lock()
 
 _MARKER_B64 = "CORTEX_CMD_B64:::"
 _MARKER_LEGACY = "CORTEX_CMD:::"
@@ -39,12 +40,12 @@ def _decode_command_from_stdout(stdout):
 def run_popup_task(executor: ThreadPoolExecutor, memory: ContextMemory):
     global _is_popup_open
 
-    if _is_popup_open:
-        return
-
-    try:
+    with _popup_lock:
+        if _is_popup_open:
+            return
         _is_popup_open = True
 
+    try:
         base_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
         popup_script = os.path.join(base_dir, "core", "ui", "InputPopup", "InputPopup.py")
 
@@ -113,7 +114,8 @@ def run_popup_task(executor: ThreadPoolExecutor, memory: ContextMemory):
     except Exception as exc:
         logging.error("Popup logic failed: %s", exc, exc_info=True)
     finally:
-        _is_popup_open = False
+        with _popup_lock:
+            _is_popup_open = False
 
 
 def setup_hotkeys(executor: ThreadPoolExecutor, memory: ContextMemory):
