@@ -146,10 +146,14 @@ class LifetimeMemoryEngine:
             for rel, emb in zip(rel_list, rel_embeddings):
                 self.relation_embeddings[rel] = emb
 
-    def _get_embedding(self, text: str):
+    def _get_embedding(self, text: str, is_query: bool = False):
         with self._embed_lock:
+            if is_query:
+                prefixed = "Represent this sentence for searching relevant passages: " + str(text)
+            else:
+                prefixed = str(text)
             return self.embedder.encode(
-                [str(text)], normalize_embeddings=True, show_progress_bar=False
+                [prefixed], normalize_embeddings=True, show_progress_bar=False
             )[0]
 
     def embed(self, texts, is_query=False):
@@ -441,7 +445,7 @@ class LifetimeMemoryEngine:
         if ent_clean in self.graph.nodes():
             return [ent_clean]
 
-        ent_emb = self._get_embedding(ent_clean)
+        ent_emb = self._get_embedding(ent_clean, is_query=True)
         matched = []
 
         for node, node_emb in self.node_embeddings.items():
@@ -564,7 +568,7 @@ class LifetimeMemoryEngine:
         res_str = "\n".join(unique[:max_items])
         return f"Observation: Found relations in Graph Memory:\n{res_str}"
 
-    def query_relevant_facts(self, current_command: str, top_k: int = 6, similarity_threshold: float = 0.55) -> str:
+    def query_relevant_facts(self, current_command: str, top_k: int = 6, similarity_threshold: float = 0.70) -> str:
         """
         Auto-injection helper: Returns a clean formatted block of top-K relevant LTM facts
         based on semantic similarity of the current user command against graph nodes.
@@ -582,7 +586,7 @@ class LifetimeMemoryEngine:
             return ""
 
         try:
-            query_emb = self._get_embedding(str(current_command).strip())
+            query_emb = self._get_embedding(str(current_command).strip(), is_query=True)
         except Exception as e:
             logger.warning(f"LTM query_relevant_facts embed failed: {e}")
             return ""
