@@ -54,8 +54,7 @@ class ContextMemory:
     )
 
     _EXPLICIT_PERMANENT_PATTERN = re.compile(
-        r"\b(yaad\s*rakhna|remember\s*that|from\s*now\s*on|aage\s*se|hamesha|always|never|"
-        r"kabhi\s*mat|kabhi\s*nahi|roz|rozana|daily|every\s*day|meri\s*aadat|usually|aksar)\b",
+        r"\b(yaad\s*rakhna|remember\s*that|from\s*now\s*on|aage\s*se)\b",
         re.IGNORECASE,
     )
 
@@ -64,13 +63,14 @@ class ContextMemory:
         re.IGNORECASE,
     )
 
-    _DURABLE_FACT_OR_HABIT_PATTERNS = [
-        r"\b(roz|rozana|hamesha|aksar|usually|always|mostly|daily|every\s*day|every\s*morning|every\s*night|never|kabhi\s*nahi|kabhi\s*mat)\b",
-        r"\b(pasand\s+hai|prefer|like\s+to|love\s+to|hate|dislike|routine|habit|aadat|favorite|favourite)\b",
+    _DURABLE_FACT_PATTERNS = [
         r"\b(yaad\s*rakhna|remember\s*that|from\s*now\s*on|aage\s*se)\b",
-        r"\b(mera\s+naam|my\s+name|mera\s+bhai|meri\s+behen|mera\s+dost|mere\s+father|mere\s+papa|meri\s+mother|meri\s+mummy|my\s+(?:father|mother|sister|brother|friend|boss))\b",
-        r"\b(rehta\s+hu|rehti\s+hu|live\s+in|padhta\s+hu|study\s+at|study\s+in|kaam\s+karta\s+hu|work\s+at|work\s+as|mera\s+number|mera\s+email|my\s+phone|my\s+email|my\s+laptop)\b",
-        r"\b(?:\d{1,2}\s*(?:bje|bajey|baj|o'?clock|pm|am))\b.*\b(?:roz|daily|usually|aksar|hamesha|coding|study|sota|uthta|kaam)\b",
+        r"\b(mera\s+naam|my\s+name|mera\s+bhai|meri\s+behen|mera\s+dost|mere\s+father|mere\s+papa|meri\s+mother|meri\s+mummy|my\s+(?:father|mother|sister|brother|friend|boss|wife|husband|son|daughter))\b",
+        r"\b(rehta\s+h(?:u|oon)|rehti\s+h(?:u|oon)|live\s+in|padhta\s+h(?:u|oon)|padhti\s+h(?:u|oon)|study\s+(?:at|in)|kaam\s+kart[ai]\s+h(?:u|oon)|work\s+(?:at|as)|mera\s+(?:number|email|laptop)|my\s+(?:phone|email|laptop))\b",
+        r"\b(meri\s+age|mera\s+age|my\s+age|meri\s+umar|mera\s+umar|i\s+am\s+\d+\s+years?\s+old)\b",
+        r"\b(mera\s+birthday|my\s+birthday|mera\s+dob|my\s+dob)\b",
+        r"\b(mera\s+college|my\s+college|mera\s+school|my\s+school|mera\s+university|my\s+university)\b",
+        r"\b(mera\s+project|my\s+project|mera\s+pet|my\s+pet)\b",
     ]
 
     def __init__(self, memory_path="Data/cortex_memory"):
@@ -111,7 +111,7 @@ class ContextMemory:
             self.ltm_client = openai.OpenAI(
                 api_key=LTM_EXTRACTION_API_KEY,
                 base_url=LTM_EXTRACTION_ENDPOINT,
-            ) if LTM_EXTRACTION_API_KEY else None
+            ) if (LTM_EXTRACTION_API_KEY and LTM_EXTRACTION_ENDPOINT) else None
         except Exception as e:
             logger.error(f"Failed to initialize LTM extraction client: {e}")
             self.ltm_client = None
@@ -120,7 +120,7 @@ class ContextMemory:
             self.summary_client = openai.OpenAI(
                 api_key=MEMORY_SUMMARY_API_KEY,
                 base_url=MEMORY_SUMMARY_ENDPOINT,
-            ) if MEMORY_SUMMARY_API_KEY else None
+            ) if (MEMORY_SUMMARY_API_KEY and MEMORY_SUMMARY_ENDPOINT) else None
         except Exception as e:
             logger.error(f"Failed to initialize summary client: {e}")
             self.summary_client = None
@@ -147,7 +147,7 @@ class ContextMemory:
             return False
 
         has_self_ref = bool(self._SELF_PRONOUN_PATTERN.search(cleaned))
-        has_durable_signal = any(re.search(p, cleaned, re.IGNORECASE) for p in self._DURABLE_FACT_OR_HABIT_PATTERNS)
+        has_durable_signal = any(re.search(p, cleaned, re.IGNORECASE) for p in self._DURABLE_FACT_PATTERNS)
 
         return bool(explicit_remember or (has_self_ref and has_durable_signal))
 
@@ -727,7 +727,7 @@ class ContextMemory:
         return messages
 
     def _generate_daily_summary(self, date_str, messages=None):
-        if not self.summary_client:
+        if not self.summary_client or not MEMORY_SUMMARY_MODEL:
             return None
         if date_str in self.daily_summaries:
             return self.daily_summaries[date_str].get("summary")
@@ -836,7 +836,7 @@ class ContextMemory:
             logger.error(f"Hybrid memory thread starting error: {e}")
 
     def _extract_hybrid_memory_ai(self, message):
-        if not self.ltm_client:
+        if not self.ltm_client or not LTM_EXTRACTION_MODEL:
             return
 
         with self._extract_lock:
@@ -1008,6 +1008,7 @@ Return STRICT JSON matching this exact schema:
             now = datetime.now()
             raw_cutoff = now - timedelta(days=MEMORY_RAW_RETENTION_DAYS)
             summary_cutoff = now - timedelta(days=MEMORY_SUMMARY_RETENTION_DAYS)
+            hard_cutoff = raw_cutoff - timedelta(days=7)
 
             day_groups = {}
             for msg in history_snapshot:
@@ -1030,6 +1031,10 @@ Return STRICT JSON matching this exact schema:
                         msg_time = datetime.fromisoformat(msg.get("timestamp", now.isoformat()))
                         if msg_time >= raw_cutoff:
                             filtered_history.append(msg)
+                        else:
+                            day_key = msg_time.strftime("%Y-%m-%d")
+                            if day_key not in self.daily_summaries and msg_time >= hard_cutoff:
+                                filtered_history.append(msg)
                     except Exception:
                         continue
 
