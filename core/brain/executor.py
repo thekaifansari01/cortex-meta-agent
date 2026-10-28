@@ -126,7 +126,10 @@ def _safe_int(val, default=None):
     if val is None:
         return default
     try:
-        return max(1, int(val))
+        result = int(val)
+        if result <= 0:
+            return default
+        return result
     except (ValueError, TypeError):
         return default
 
@@ -717,6 +720,10 @@ def execute_tools_parallel(action_dict: Dict[str, Any]):
                 observations.append(f"Observation Error: {e}")
 
     if image_payload:
+        if observations:
+            combined = "\n\n".join(observations)
+            existing = image_payload.get("observation", "")
+            image_payload["observation"] = f"{combined}\n\n{existing}" if existing else combined
         return image_payload
 
     if not observations:
