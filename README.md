@@ -9,18 +9,17 @@
 [![Windows](https://img.shields.io/badge/Windows-10%2F11-0078D6?style=for-the-badge&logo=windows&logoColor=white)]()
 
 ---
-
 ## 🏆 Built for the Meta Global AI Developer Hackathon
-This project was built from scratch during the hackathon (Oct 26 – Nov 4, 2026) to push the boundaries of what AI agents can do on a local operating system. It specifically targets the **"Build for Your World"** and **"Push the Frontier"** problem statements.
+This project was developed for the hackathon (Oct 26 – Nov 4, 2026) targeting the **"Build for Your World"** and **"Push the Frontier"** problem statements.
 
 ### 🚀 What Was Built During the Hackathon (New Work)
-While the foundational idea of a local agent existed, the following core components were specifically engineered during the 10-day hackathon:
-*   **Meta Muse Spark Integration:** Built a provider-agnostic `BasetenProvider` to handle the `meta-models/muse-spark-open-1026` model, utilizing its native tool-calling and reasoning capabilities.
-*   **Advanced Truncation Self-Correction:** Engineered a custom parser that detects broken JSON mid-stream and forces the agent to retry with smaller payloads.
-*   **Real-time Mid-Execution Correction:** Implemented a ZeroMQ-based live feedback loop allowing users to interrupt and redirect the agent mid-task.
-*   **GUI Grounding (OCR + UIA):** Built a Set-of-Mark (SoM) visual grounding system that maps screen elements to precise bounding boxes.
-*   **ZeroMQ IPC Architecture:** Decoupled the heavy AI loop from the PyQt5 UI for zero-latency, asynchronous UI updates.
+I used my prior open-source OS automation framework as a foundational base. However, to meet the hackathon criteria, I completely overhauled the AI architecture and built the following core components **from scratch during the 10-day event**:
 
+*   **Meta Muse Spark Integration:** Built a new `BasetenProvider` module from scratch to handle the `meta-models/muse-spark-open-1026` model, adapting the agentic loop to utilize Muse Spark's native tool-calling and reasoning capabilities.
+*   **Advanced Truncation Self-Correction:** Engineered a custom parser that detects broken JSON mid-stream from the LLM and forces the agent to retry with smaller payloads (built during the hackathon).
+*   **Real-time Mid-Execution Correction:** Implemented a ZeroMQ-based live feedback loop allowing users to interrupt and redirect the agent mid-task (built during the hackathon).
+*   **GUI Grounding (OCR + UIA):** Built a new Set-of-Mark (SoM) visual grounding system that maps screen elements to precise bounding boxes (built during the hackathon).
+*   **ZeroMQ IPC Architecture:** Decoupled the heavy AI loop from the PyQt5 UI for zero-latency, asynchronous UI updates (built during the hackathon).
 ---
 
 ## 💡 Why Cortex? (Impact)
