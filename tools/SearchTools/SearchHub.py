@@ -31,7 +31,7 @@ def execute_search_actions(search_actions_dict):
         if search_actions_dict.get("read_webpage"):
             futures[executor.submit(scrape_webpage, search_actions_dict["read_webpage"])] = "Web Reader"
             
-        for future in as_completed(futures):
+        for future in as_completed(futures, timeout=90):
             source = futures[future]
             try:
                 result_text = future.result()

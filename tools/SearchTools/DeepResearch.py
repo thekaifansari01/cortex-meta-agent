@@ -11,7 +11,11 @@ from google import genai
 from google.genai import types
 from tavily import TavilyClient
 
-from core.brain.config import GEMINI_AGENT_MODEL, DEEP_RESEARCH_TIMEOUT, GEMINI_API_KEY
+from core.brain.config import DEEP_RESEARCH_TIMEOUT, GEMINI_API_KEY
+try:
+    from core.brain.config import GEMINI_AGENT_MODEL
+except ImportError:
+    GEMINI_AGENT_MODEL = os.getenv("GEMINI_AGENT_MODEL", "gemini-2.0-flash-exp")
 from core.ui.agent_status import update_agent_status
 from core.logger.logger import logger
 
@@ -76,7 +80,14 @@ def deep_research(topic, max_steps=None):
         tavily_client = TavilyClient(api_key=tavily_api_key)
 
         logger.info("Requesting Tavily Pro Research (this may take a few minutes)...")
-        response = tavily_client.research(topic, model="pro")
+        import concurrent.futures
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as _ex:
+            _future = _ex.submit(tavily_client.research, topic, model="pro")
+            try:
+                response = _future.result(timeout=180)
+            except concurrent.futures.TimeoutError:
+                logger.error("Tavily research() call timed out after 180s")
+                return "Error: Tavily research() call timed out. Please retry."
         request_id = response.get("request_id")
 
         if not request_id:

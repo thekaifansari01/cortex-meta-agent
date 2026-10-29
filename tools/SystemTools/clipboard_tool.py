@@ -2,18 +2,18 @@ import pyperclip
 from core.logger.logger import logger
 
 def read_clipboard():
-    """Reads text from the system clipboard."""
     try:
         content = pyperclip.paste()
         if content:
+            if len(content) > 100000:
+                content = content[:100000] + "\n\n...[CLIPBOARD CONTENT TRUNCATED]..."
             logger.info("📋 Clipboard Tool: Read successful.")
             return content
-        else:
-            logger.info("📋 Clipboard Tool: Clipboard is empty.")
-            return ""
+        logger.info("📋 Clipboard Tool: Clipboard is empty.")
+        return ""
     except Exception as e:
         logger.error(f"❌ Clipboard read failed: {e}")
-        return None
+        raise RuntimeError(f"Clipboard read failed: {e}")
 
 def write_clipboard(text):
     """Writes text to the system clipboard."""

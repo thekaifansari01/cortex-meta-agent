@@ -20,7 +20,9 @@ async def _send_msg(to_target, message, attachment_paths):
     if not message and not attachment_paths:
         return "Error: Both message and attachments cannot be empty."
 
-    valid_attachments = [p for p in (attachment_paths or []) if os.path.exists(p)]
+    if isinstance(attachment_paths, str):
+        attachment_paths = [attachment_paths]
+    valid_attachments = [p for p in (attachment_paths or []) if isinstance(p, str) and os.path.exists(p)]
 
     async with TelegramClient(SESSION_FILE, API_ID, API_HASH) as client:
         if valid_attachments:

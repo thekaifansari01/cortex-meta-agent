@@ -1,5 +1,5 @@
-const fs = require('fs');
-const path = require('path');
+import fs from 'fs';
+import path from 'path';
 
 const MIME_MAP = {
     '.pdf': 'application/pdf',
@@ -21,7 +21,7 @@ const MIME_MAP = {
     '.m4a': 'audio/mp4'
 };
 
-module.exports = async (req, res, getSock) => {
+export default async (req, res, getSock) => {
     try {
         const sock = getSock();
 
@@ -64,6 +64,21 @@ module.exports = async (req, res, getSock) => {
         if (file_path) {
             if (!fs.existsSync(file_path)) {
                 return res.status(400).json({ error: `Attachment file not found at path: ${file_path}` });
+            }
+
+            try {
+                const stats = fs.statSync(file_path);
+                const MAX_BYTES = 100 * 1024 * 1024;
+                if (stats.size > MAX_BYTES) {
+                    return res.status(413).json({
+                        error: `File too large (${Math.round(stats.size / 1024 / 1024)}MB). WhatsApp limit is 100MB.`
+                    });
+                }
+                if (stats.size === 0) {
+                    return res.status(400).json({ error: "Attachment file is empty (0 bytes)." });
+                }
+            } catch (statErr) {
+                return res.status(500).json({ error: `Cannot read file size: ${statErr.message}` });
             }
 
             console.log(`📤 Preparing to send File: ${file_path} to ${targetJid}`);

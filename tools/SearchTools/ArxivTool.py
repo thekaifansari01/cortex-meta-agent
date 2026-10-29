@@ -11,10 +11,16 @@ def search_arxiv(query, max_results=3):
     try:
         client = arxiv.Client()
         
+        query_lower = str(query).lower()
+        recency_markers = ("latest", "recent", "newest", "2024", "2025", "this year", "current")
+        if any(m in query_lower for m in recency_markers):
+            _sort = arxiv.SortCriterion.SubmittedDate
+        else:
+            _sort = arxiv.SortCriterion.Relevance
         search = arxiv.Search(
             query=query,
             max_results=max_results,
-            sort_by=arxiv.SortCriterion.Relevance
+            sort_by=_sort
         )
         
         results_text = f"🔬 ARXIV RESEARCH PAPERS FOR '{query}':\n\n"
@@ -24,10 +30,18 @@ def search_arxiv(query, max_results=3):
             papers_found = True
             
             clean_summary = result.summary.replace('\n', ' ').strip()
-            authors = ', '.join([a.name for a in result.authors])
+            _author_list = [a.name for a in result.authors]
+            if len(_author_list) > 10:
+                authors = ', '.join(_author_list[:10]) + f", +{len(_author_list) - 10} more"
+            else:
+                authors = ', '.join(_author_list)
             
             results_text += f"Title: {result.title}\n"
-            results_text += f"Published: {result.published.strftime('%Y-%m-%d')} | Category: {result.primary_category}\n"
+            try:
+                published_str = result.published.strftime('%Y-%m-%d') if result.published else "Unknown"
+            except Exception:
+                published_str = "Unknown"
+            results_text += f"Published: {published_str} | Category: {result.primary_category}\n"
             results_text += f"Authors: {authors}\n"
             results_text += f"Paper Link: {result.entry_id}\n"
             results_text += f"PDF Link: {result.pdf_url}\n"

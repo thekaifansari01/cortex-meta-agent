@@ -12,11 +12,18 @@ def close_any_app(apps_to_close):
         logger.info(f"Attempting to smoothly close '{name}'...")
 
         try:
-            close(name_lower, match_closest=True, throw_error=True)
+            close(name_lower, match_closest=False, throw_error=True)
             logger.info(f"Successfully closed: {name}")
             closed.append(name)
 
         except Exception as e:
+            try:
+                close(name_lower, match_closest=True, throw_error=True)
+                logger.info(f"Successfully closed (closest match): {name}")
+                closed.append(name)
+                continue
+            except Exception as _e2:
+                e = _e2
             error_msg = str(e).lower()
 
             if "not running" in error_msg:

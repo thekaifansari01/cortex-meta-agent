@@ -8,7 +8,24 @@ import platform
 import re
 import sys
 import shlex
+import uuid
 from core.logger.logger import logger
+
+
+def _expand_for_check(target: str, base_cwd: str) -> str:
+    t = target.strip()
+    if not t:
+        return ""
+    if t.startswith("~"):
+        rest = t[1:].lstrip("/\\")
+        home = os.path.expanduser("~")
+        t = os.path.join(home, rest) if rest else home
+    if t in ("..", "../", "..\\"):
+        try:
+            t = os.path.abspath(os.path.join(base_cwd, ".."))
+        except Exception:
+            pass
+    return t
 
 
 def _is_single_cmd_destroyer(sub_command: str, base_cwd: str) -> bool:
@@ -81,16 +98,23 @@ def _is_single_cmd_destroyer(sub_command: str, base_cwd: str) -> bool:
             targets.append(token)
 
         if not targets:
-            if sub_command.endswith('/') or sub_command.endswith('/*') or sub_command.endswith('\\') or sub_command.endswith('\\*'):
+            if sub_command.endswith(('/', '/*', '\\', '\\*')):
                 return True
             return False
 
         for target in targets:
             clean_target = target.rstrip('*').strip()
-            if not clean_target or clean_target in ['/', '\\', '.']:
+            if not clean_target:
                 return True
+            if clean_target in ('/', '\\', '.', '~', '~/', '..', '../', '~\\'):
+                return True
+
+            expanded = _expand_for_check(clean_target, base_cwd)
+            if not expanded:
+                continue
+
             try:
-                candidate = clean_target if os.path.isabs(clean_target) else os.path.join(base_cwd, clean_target)
+                candidate = expanded if os.path.isabs(expanded) else os.path.join(base_cwd, expanded)
                 abs_path = os.path.normcase(os.path.realpath(candidate))
             except Exception:
                 continue
@@ -99,19 +123,33 @@ def _is_single_cmd_destroyer(sub_command: str, base_cwd: str) -> bool:
                 norm_trimmed = abs_path.rstrip('\\')
                 if re.match(r'^[a-z]:$', norm_trimmed):
                     return True
-                protected_win = [
-                    'c:\\windows',
-                    'c:\\windows\\system32',
-                    'c:\\program files',
-                    'c:\\program files (x86)',
-                    'c:\\users',
-                ]
-                if norm_trimmed in protected_win or any(norm_trimmed.startswith(p + '\\') for p in ['c:\\windows', 'c:\\windows\\system32']):
+                if re.match(r'^[a-z]:\\users$', norm_trimmed):
                     return True
+                if re.match(r'^[a-z]:\\users\\[^\\]+$', norm_trimmed):
+                    return True
+                for drive_letter in [chr(c) for c in range(ord('a'), ord('z') + 1)]:
+                    for p in (
+                        f'{drive_letter}:\\windows',
+                        f'{drive_letter}:\\windows\\system32',
+                        f'{drive_letter}:\\program files',
+                        f'{drive_letter}:\\program files (x86)',
+                    ):
+                        if norm_trimmed == p or norm_trimmed.startswith(p + '\\'):
+                            return True
             else:
                 norm_trimmed = abs_path.rstrip('/') or '/'
-                protected_unix = ['/', '/boot', '/etc', '/usr', '/bin', '/sbin', '/lib', '/lib64', '/dev', '/var', '/root', '/home']
+                protected_unix = [
+                    '/', '/boot', '/etc', '/usr', '/bin', '/sbin', '/lib', '/lib64',
+                    '/dev', '/var', '/root', '/home', '/opt', '/srv', '/sys', '/proc',
+                    '/run',
+                ]
                 if norm_trimmed in protected_unix:
+                    return True
+                for p in ('/boot', '/etc', '/usr', '/bin', '/sbin', '/lib', '/lib64',
+                          '/dev', '/sys', '/proc', '/root', '/var'):
+                    if norm_trimmed.startswith(p + '/'):
+                        return True
+                if re.match(r'^/home/[^/]+$', norm_trimmed):
                     return True
 
         return False
@@ -122,12 +160,10 @@ def _is_single_cmd_destroyer(sub_command: str, base_cwd: str) -> bool:
 def _is_system_destroyer(command: str, cwd: str = None) -> bool:
     if not command or not command.strip():
         return False
-
     base_cwd = cwd if (cwd and os.path.isdir(cwd)) else os.path.expanduser("~")
-    sub_commands = re.split(r'\s*(?:&&|\|\||;|\||\n|(?<![>&])&(?![>&]))\s*', command.strip())
-
-    for sub_cmd in sub_commands:
-        if _is_single_cmd_destroyer(sub_cmd, base_cwd):
+    parts = re.split(r'\s*(?:&&|\|\||;|\||\n|(?<![>&])&(?![>&]))\s*', command.strip())
+    for part in parts:
+        if _is_single_cmd_destroyer(part, base_cwd):
             return True
     return False
 
@@ -147,7 +183,7 @@ def is_python_code_safe(code: str) -> bool:
 
     code_lower = code.lower()
 
-    lethal_system_targets = [
+    lethal_targets = [
         r'c:[/\\]+windows',
         r'system32',
         r'\\\\\.\\physicaldrive',
@@ -158,29 +194,29 @@ def is_python_code_safe(code: str) -> bool:
         r'/etc/shadow',
     ]
 
-    file_delete_patterns = [r'shutil\.rmtree', r'os\.remove', r'os\.unlink', r'os\.rmdir', r'os\.chmod', r'os\.chown', r'\.unlink\s*\(', r'\.rmdir\s*\(']
+    file_delete_patterns = [
+        r'shutil\.rmtree', r'os\.remove', r'os\.unlink',
+        r'os\.rmdir', r'os\.chmod', r'os\.chown',
+        r'\.unlink\s*\(', r'\.rmdir\s*\(',
+    ]
     if any(re.search(p, code) for p in file_delete_patterns):
-        if any(re.search(t, code_lower) for t in lethal_system_targets):
+        if any(re.search(t, code_lower) for t in lethal_targets):
             return False
 
     os_exec_patterns = [r'\bsubprocess\b', r'os\.system', r'os\.popen', r'os\.spawn']
     if any(re.search(p, code) for p in os_exec_patterns):
-        risky_shell_commands = [
+        risky = [
             r'\brm\s+-[rf]+\s+/',
+            r'\brm\s+-[rf]+\s+~',
+            r'\brm\s+-[rf]+\s+\.\.',
             r'\bformat\s+[a-z]:',
-            r'\bfdisk\b',
-            r'\bmkfs\b',
-            r'\bparted\b',
-            r'\bshutdown\b',
-            r'\breboot\b',
-            r'\bpoweroff\b',
-            r'\bdiskpart\b',
-            r'\bvssadmin\b',
-            r'\bbcdedit\b',
+            r'\bfdisk\b', r'\bmkfs\b', r'\bparted\b',
+            r'\bshutdown\b', r'\breboot\b', r'\bpoweroff\b',
+            r'\bdiskpart\b', r'\bvssadmin\b', r'\bbcdedit\b',
         ]
-        if any(re.search(r_cmd, code_lower) for r_cmd in risky_shell_commands):
+        if any(re.search(r_cmd, code_lower) for r_cmd in risky):
             return False
-        if any(re.search(t, code_lower) for t in lethal_system_targets):
+        if any(re.search(t, code_lower) for t in lethal_targets):
             return False
 
     return True
@@ -224,7 +260,11 @@ class StatefulTerminal:
             cwd=self.cwd,
             env=custom_env,
         )
-        self.reader_thread = threading.Thread(target=self._read_output, args=(self.process.stdout, self.output_queue), daemon=True)
+        self.reader_thread = threading.Thread(
+            target=self._read_output,
+            args=(self.process.stdout, self.output_queue),
+            daemon=True,
+        )
         self.reader_thread.start()
         self._read_until_empty(timeout=0.2)
 
@@ -290,7 +330,7 @@ class StatefulTerminal:
                 self._start_process()
 
             self._drain_queue()
-            marker = f"__CMD_END_{int(time.time() * 1000)}__"
+            marker = f"__CMD_END_{uuid.uuid4().hex}__"
 
             if self.is_windows:
                 full_command = f"@echo off\n{command}\n@echo {marker}:%ERRORLEVEL%:%CD%\n"
@@ -370,7 +410,10 @@ def execute_terminal_command(command: str, timeout_seconds: int = 30) -> str:
         return "Observation: [ERROR] Empty terminal command provided."
 
     try:
-        timeout_seconds = max(1, int(timeout_seconds))
+        parsed = int(timeout_seconds)
+        if parsed <= 0:
+            parsed = 30
+        timeout_seconds = parsed
     except (ValueError, TypeError):
         timeout_seconds = 30
 
@@ -394,16 +437,28 @@ def execute_terminal_command(command: str, timeout_seconds: int = 30) -> str:
             )
             output = (result.stdout + "\n" + result.stderr).strip()
             if result.returncode != 0:
-                return f"Observation: [FAILED] SSH command exited with code {result.returncode}.\nOutput:\n{output}"
+                return (
+                    f"Observation: [FAILED] SSH command exited with code {result.returncode}.\n"
+                    f"Output:\n{output}\n\n"
+                    f"Hint: Password-based SSH will not work in this non-interactive environment. "
+                    f"Ensure SSH key auth is configured on the target host."
+                )
             if output:
                 return f"Observation: Command executed.\nOutput:\n{output}"
             return "Observation: Command executed successfully with no output."
         except subprocess.TimeoutExpired:
-            return f"Observation: [ERROR] SSH command timed out after {timeout_seconds} seconds."
+            return (
+                f"Observation: [ERROR] SSH command timed out after {timeout_seconds} seconds.\n"
+                f"Hint: Password-based SSH will not work in this non-interactive environment. "
+                f"Ensure SSH key auth is configured on the target host."
+            )
         except Exception as e:
             return f"Observation: [ERROR] SSH execution crashed -> {str(e)}"
 
-    heavy_keywords = ['pip install', 'npm install', 'npm i ', 'git clone', 'yarn add', 'pnpm install', 'apt-get install']
+    heavy_keywords = [
+        'pip install', 'npm install', 'npm i ', 'git clone',
+        'yarn add', 'pnpm install', 'apt-get install',
+    ]
     if any(kw in command.lower() for kw in heavy_keywords) and timeout_seconds <= 30:
         timeout_seconds = 180
         logger.warning(f"[HEAVY COMMAND DETECTED]: Auto-extending terminal timeout to {timeout_seconds} seconds.")
@@ -444,6 +499,11 @@ def run_python_code(code_string: str) -> str:
         env["PYTHONIOENCODING"] = "utf-8"
         env["PYTHONUNBUFFERED"] = "1"
         python_path = sys.executable
+
+        exec_cwd = None
+        if _terminal_session is not None and _terminal_session.cwd and os.path.isdir(_terminal_session.cwd):
+            exec_cwd = _terminal_session.cwd
+
         result = subprocess.run(
             [python_path, temp_path],
             stdin=subprocess.DEVNULL,
@@ -453,6 +513,7 @@ def run_python_code(code_string: str) -> str:
             errors='replace',
             env=env,
             timeout=120,
+            cwd=exec_cwd,
         )
         output = result.stdout.strip()
         error = result.stderr.strip()
@@ -466,8 +527,7 @@ def run_python_code(code_string: str) -> str:
             full_output = full_output[:25000] + "\n\n... [TRUNCATED] ...\n\n" + full_output[-25000:]
         if result.returncode == 0:
             return f"Observation: Python code executed successfully.\n{full_output}".strip()
-        else:
-            return f"Observation: [FAILED] Python script failed (exit code {result.returncode}).\n{full_output}".strip()
+        return f"Observation: [FAILED] Python script failed (exit code {result.returncode}).\n{full_output}".strip()
     except subprocess.TimeoutExpired:
         return "Observation: [ERROR] Python script timed out after 120 seconds."
     except Exception as e:

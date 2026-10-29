@@ -575,7 +575,7 @@ def _verify_expected_text(eid, expected_text):
             return None
         if len(actual) >= 4 and len(actual) >= int(len(expected_lower) * 0.6) and actual in expected_lower:
             return None
-        if difflib.SequenceMatcher(None, expected_lower, actual).ratio() >= 0.72:
+        if difflib.SequenceMatcher(None, expected_lower, actual).ratio() >= 0.88:
             return None
 
     candidates = []
@@ -591,7 +591,7 @@ def _verify_expected_text(eid, expected_text):
             is_match = (
                 expected_lower in e_text
                 or e_text in expected_lower
-                or difflib.SequenceMatcher(None, expected_lower, e_text).ratio() >= 0.65
+                or difflib.SequenceMatcher(None, expected_lower, e_text).ratio() >= 0.82
             )
         if is_match:
             cx, cy = _element_center(e)

@@ -1,4 +1,7 @@
 import os
+import platform
+import subprocess
+import threading
 import ctypes
 from ctypes import cast, POINTER
 import comtypes
@@ -6,15 +9,31 @@ from comtypes import CLSCTX_ALL
 import pycaw.pycaw as pycaw_module
 from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
 import screen_brightness_control as sbc
-import traceback
 from datetime import datetime
 from PIL import ImageGrab
 from core.logger.logger import logger
 
+_com_lock = threading.Lock()
+_com_initialized_threads = set()
+
+
+def _ensure_com_initialized():
+    tid = threading.get_ident()
+    with _com_lock:
+        if tid in _com_initialized_threads:
+            return
+    try:
+        comtypes.CoInitialize()
+        with _com_lock:
+            _com_initialized_threads.add(tid)
+    except Exception:
+        pass
+
+
 class SystemController:
     @staticmethod
     def _get_audio_interface():
-        comtypes.CoInitialize()
+        _ensure_com_initialized()
         devices = AudioUtilities.GetSpeakers()
         if hasattr(devices, '_dev'):
             devices = devices._dev
@@ -40,9 +59,10 @@ class SystemController:
             msg = f"Volume set to {int(new_vol * 100)}%"
             logger.info(f"✅ {msg}")
             return msg
-
         except Exception as pycaw_err:
             logger.warning(f"Pycaw volume error, trying fallback: {pycaw_err}")
+            if platform.system() != "Windows":
+                return f"Volume control error: {pycaw_err}"
             try:
                 HWND_BROADCAST = 0xFFFF
                 WM_APPCOMMAND = 0x0319
@@ -66,7 +86,7 @@ class SystemController:
                 logger.info(f"✅ {msg}")
                 return msg
             except Exception as native_err:
-                msg = f"Volume control fully failed. Pycaw: {pycaw_err} | Native: {native_err}"
+                msg = f"Volume control failed. Pycaw: {pycaw_err} | Native: {native_err}"
                 logger.error(msg)
                 return msg
 
@@ -82,37 +102,52 @@ class SystemController:
             logger.info(f"✅ {msg}")
             return msg
         except Exception as e:
+            if platform.system() != "Windows":
+                return f"Speaker mute error: {e}"
             try:
                 HWND_BROADCAST = 0xFFFF
                 WM_APPCOMMAND = 0x0319
                 APPCOMMAND_VOLUME_MUTE = 0x80000
                 ctypes.windll.user32.SendMessageW(HWND_BROADCAST, WM_APPCOMMAND, 0, APPCOMMAND_VOLUME_MUTE)
-                msg = "System speakers mute state toggled (via fallback)."
+                msg = "System speakers mute state toggled."
                 logger.info(f"✅ {msg}")
                 return msg
             except Exception as native_err:
-                msg = f"Speaker mute error: {str(e)}"
-                logger.error(msg)
-                return msg
+                return f"Speaker mute error: {e} | {native_err}"
 
     @staticmethod
     def change_brightness(amount: int, relative: bool = True):
         logger.info(f"☀️ Brightness change: amount={amount}, relative={relative}")
         try:
-            current_brightness = sbc.get_brightness()[0]
-
+            try:
+                displays = sbc.list_monitors()
+            except Exception:
+                displays = []
+            if not displays:
+                try:
+                    current = sbc.get_brightness()[0]
+                    target = current + amount if relative else amount
+                    target = max(0, min(100, target))
+                    sbc.set_brightness(target)
+                    return f"Brightness set to {target}%"
+                except Exception as e:
+                    return f"Brightness control error: {e}"
+            for display in displays:
+                try:
+                    current_brightness = sbc.get_brightness(display=display)[0]
+                    target = current_brightness + amount if relative else amount
+                    target = max(0, min(100, target))
+                    sbc.set_brightness(target, display=display)
+                except Exception as disp_err:
+                    logger.warning(f"Brightness error on {display}: {disp_err}")
             if relative:
-                new_brightness = current_brightness + amount
+                msg = f"Brightness adjusted by {amount:+d}% on {len(displays)} display(s)"
             else:
-                new_brightness = amount
-
-            new_brightness = max(0, min(100, new_brightness))
-            sbc.set_brightness(new_brightness)
-            msg = f"Brightness set to {new_brightness}%"
+                msg = f"Brightness set to {max(0, min(100, amount))}% on {len(displays)} display(s)"
             logger.info(f"✅ {msg}")
             return msg
         except Exception as e:
-            msg = f"Brightness control error (Might be unsupported on this monitor): {str(e)}"
+            msg = f"Brightness control error: {str(e)}"
             logger.error(msg)
             return msg
 
@@ -120,8 +155,31 @@ class SystemController:
     def lock_pc():
         logger.info("🔒 Locking PC")
         try:
-            ctypes.windll.user32.LockWorkStation()
-            msg = "PC Locked successfully."
+            system = platform.system()
+            if system == "Windows":
+                ctypes.windll.user32.LockWorkStation()
+                msg = "PC Locked successfully."
+            elif system == "Darwin":
+                subprocess.run(
+                    ["/System/Library/CoreServices/Menu Extras/User.menu/Contents/Resources/CGSession", "-suspend"],
+                    check=False, timeout=5
+                )
+                msg = "Screen locked (macOS)."
+            else:
+                locked = False
+                for cmd in (
+                    ["loginctl", "lock-session"],
+                    ["gnome-screensaver-command", "-l"],
+                    ["xdg-screensaver", "lock"],
+                ):
+                    try:
+                        result = subprocess.run(cmd, capture_output=True, timeout=3)
+                        if result.returncode == 0:
+                            locked = True
+                            break
+                    except Exception:
+                        continue
+                msg = "PC Locked successfully." if locked else "Lock failed: no supported lock command available on this Linux environment."
             logger.info(f"✅ {msg}")
             return msg
         except Exception as e:
@@ -133,7 +191,13 @@ class SystemController:
     def sleep_pc():
         logger.info("💤 Putting PC to sleep")
         try:
-            os.system("rundll32.exe powrprof.dll,SetSuspendState 0,1,0")
+            system = platform.system()
+            if system == "Windows":
+                os.system("rundll32.exe powrprof.dll,SetSuspendState 0,1,0")
+            elif system == "Darwin":
+                os.system("pmset sleepnow")
+            else:
+                os.system("systemctl suspend")
             msg = "PC put to sleep mode."
             logger.info(f"✅ {msg}")
             return msg
@@ -147,20 +211,22 @@ class SystemController:
         logger.info(f"📸 Capturing screenshot, filename={filename}, save_dir={save_dir}")
         try:
             if not save_dir:
-                save_dir = "C:/Documents/Cortex/Screenshots"
+                save_dir = os.path.join(os.path.expanduser("~"), "Documents", "Cortex", "Screenshots")
 
             if filename:
-                clean_filename = filename.replace("/", os.sep).replace("\\", os.sep)
-                if not clean_filename.lower().endswith(('.png', '.jpg', '.jpeg')):
-                    clean_filename += ".png"
-                
-                if os.path.isabs(clean_filename):
-                    filepath = clean_filename
-                else:
-                    filepath = os.path.join(save_dir, clean_filename)
+                raw = str(filename).replace("\\", "/")
+                clean = raw.split("/")[-1]
+                clean = clean.replace("..", "_").strip()
+                if not clean:
+                    clean = f"screenshot_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
+                if not clean.lower().endswith((".png", ".jpg", ".jpeg")):
+                    clean += ".png"
+                filepath = os.path.join(save_dir, clean)
             else:
-                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                filepath = os.path.join(save_dir, f"screenshot_{timestamp}.png")
+                filepath = os.path.join(
+                    save_dir,
+                    f"screenshot_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png",
+                )
 
             parent_dir = os.path.dirname(filepath)
             if parent_dir:

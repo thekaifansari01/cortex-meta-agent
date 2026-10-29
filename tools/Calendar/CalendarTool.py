@@ -17,7 +17,7 @@ COOKIES_DIR = BASE_DIR / "Data" / "SessionCookies"
 COOKIES_DIR.mkdir(parents=True, exist_ok=True)
 TOKEN_PATH = COOKIES_DIR / "calendar_token.enc"
 SCOPES = ['https://www.googleapis.com/auth/calendar']
-DEFAULT_TIMEZONE = 'Asia/Kolkata'
+DEFAULT_TIMEZONE = os.getenv("CALENDAR_TIMEZONE") or 'Asia/Kolkata'
 
 _service_cache = None
 _service_lock = threading.Lock()
@@ -31,8 +31,8 @@ def helper_format_to_iso(time_str: str, default_time_suffix: str = "00:00:00") -
     try:
         if len(time_str) == 10:
             time_str = f"{time_str} {default_time_suffix}"
-        dt = datetime.datetime.strptime(time_str, "%Y-%m-%d %H:%M:%S")
-        return dt.strftime('%Y-%m-%dT%H:%M:%S+05:30')
+        dt = datetime.datetime.strptime(time_str, "%Y-%m-%d %H:%M:%S").astimezone()
+        return dt.strftime('%Y-%m-%dT%H:%M:%S%z')
     except Exception:
         return ""
 
@@ -69,6 +69,7 @@ def authenticate_calendar(interactive: bool = True):
                 try:
                     creds.refresh(Request())
                     save_encrypted_token(json.loads(creds.to_json()), str(TOKEN_PATH))
+                    clear_calendar_cache()
                     logger.info("🔄 Calendar token refreshed.")
                 except Exception:
                     creds = None
@@ -82,7 +83,7 @@ def authenticate_calendar(interactive: bool = True):
                 secure_session = str(uuid.uuid4())
                 logger.info("🌐 Opening browser for Calendar OAuth...")
                 webbrowser.open(f"https://jarvis-os-agent.vercel.app/api/oauth/start?service=calendar&state={secure_session}")
-                timeout = 120
+                timeout = 300
                 start_time = time.time()
                 while time.time() - start_time < timeout:
                     if TOKEN_PATH.exists():
@@ -122,6 +123,14 @@ def create_event(summary: str, start_time: str, end_time: str, description: str 
     if not start_iso or not end_iso:
         logger.error("Invalid time format in create_event")
         return "Observation: Error -> Invalid time format provided. Use 'YYYY-MM-DD HH:MM:SS' format."
+
+    try:
+        _start_dt = datetime.datetime.fromisoformat(start_iso.replace("Z", "+00:00"))
+        _end_dt = datetime.datetime.fromisoformat(end_iso.replace("Z", "+00:00"))
+        if _end_dt <= _start_dt:
+            return "Observation: Error -> 'end_time' must be strictly after 'start_time'. Please provide a valid time range."
+    except Exception:
+        pass
 
     try:
         event_body = {
@@ -204,15 +213,20 @@ def delete_event(event_id: str = None, summary_query: str = None) -> str:
             ).execute()
 
             events = events_result.get('items', [])
-            target_id = None
-            matched_title = ""
-
+            matched = []
             for event in events:
                 title = event.get('summary', '').lower()
                 if summary_query.lower() in title:
-                    target_id = event.get('id')
-                    matched_title = event.get('summary')
-                    break
+                    matched.append({"id": event.get('id'), "title": event.get('summary', '')})
+
+            if len(matched) > 1:
+                listing = "\n".join(f"- '{m['title']}' | ID: '{m['id']}'" for m in matched[:10])
+                return (
+                    f"Observation: Error -> Multiple events match '{summary_query}'. Please specify exact event_id:\n{listing}"
+                )
+
+            target_id = matched[0]["id"] if matched else None
+            matched_title = matched[0]["title"] if matched else ""
 
             if target_id:
                 service.events().delete(calendarId='primary', eventId=target_id).execute()

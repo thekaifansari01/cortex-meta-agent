@@ -1,7 +1,9 @@
 import os
+import json
 import base64
 import py_compile
 from core.logger.logger import logger
+
 
 class JarvisFileEditor:
     def __init__(self, workspace_dir=None):
@@ -11,24 +13,34 @@ class JarvisFileEditor:
         self.MAX_REPO_MAP_DEPTH = 6
         self.MAX_REPO_MAP_FILES = 200
         self.MAX_VIEW_CHARS = 15000
+        self.MAX_BATCH_VIEW_CHARS = 30000
         logger.debug(f"FileEditor initialized with workspace: {self.workspace}")
 
     def _validate_syntax(self, file_path):
-        if not file_path.endswith(".py"):
-            return ""
-        try:
-            py_compile.compile(file_path, doraise=True)
-            return " [Syntax Check: OK]"
-        except py_compile.PyCompileError as e:
-            return f"\n[CRITICAL SYNTAX ERROR DETECTED AFTER EDIT]:\n{e.msg}"
-        except Exception as e:
-            return f"\n[LINTER WARNING]: {str(e)}"
+        lower = file_path.lower()
+        if lower.endswith(".py"):
+            try:
+                py_compile.compile(file_path, cfile=os.devnull, doraise=True)
+                return " [Syntax Check: OK]"
+            except py_compile.PyCompileError as e:
+                return f"\n[CRITICAL SYNTAX ERROR DETECTED AFTER EDIT]:\n{e.msg}"
+            except Exception as e:
+                return f"\n[LINTER WARNING]: {str(e)}"
+        if lower.endswith(".json"):
+            try:
+                with open(file_path, "r", encoding="utf-8") as f:
+                    json.load(f)
+                return " [JSON Check: OK]"
+            except json.JSONDecodeError as e:
+                return f"\n[CRITICAL JSON ERROR DETECTED AFTER EDIT]:\n{e}"
+            except Exception as e:
+                return f"\n[JSON LINT WARNING]: {str(e)}"
+        return ""
 
     def _normalize_block(self, block):
         if not block:
             return block
         lines = block.split('\n')
-        lines = [line.rstrip() for line in lines]
         while lines and not lines[0].strip():
             lines.pop(0)
         while lines and not lines[-1].strip():
@@ -39,7 +51,24 @@ class JarvisFileEditor:
         if len(text) <= max_chars:
             return text
         half = max_chars // 2
-        return (f"{text[:half]}\n[... TRUNCATED: {len(text) - max_chars} chars ...]\n{text[-half:]}")
+        return f"{text[:half]}\n[... TRUNCATED: {len(text) - max_chars} chars ...]\n{text[-half:]}"
+
+    def _read_preserve_newline(self, file_path):
+        with open(file_path, "rb") as f:
+            raw = f.read()
+        has_crlf = b"\r\n" in raw
+        text = raw.decode("utf-8", errors="replace")
+        normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+        return normalized, has_crlf
+
+    def _write_preserve_newline(self, file_path, content, use_crlf):
+        if use_crlf:
+            output = content.replace("\n", "\r\n")
+            with open(file_path, "w", encoding="utf-8", newline="") as f:
+                f.write(output)
+        else:
+            with open(file_path, "w", encoding="utf-8", newline="\n") as f:
+                f.write(content)
 
     def get_repo_map(self, file_path=None, max_files=None, max_depth=None):
         logger.info(f"📁 Generating repo map for path: {file_path or self.workspace}")
@@ -48,10 +77,8 @@ class JarvisFileEditor:
         try:
             target_path = file_path if file_path else self.workspace
             if not os.path.exists(target_path):
-                logger.error(f"Path does not exist: {target_path}")
                 return f"[ERROR] Path '{target_path}' does not exist. Please provide a valid absolute path."
             if not os.path.isdir(target_path):
-                logger.error(f"Path is not a directory: {target_path}")
                 return f"[ERROR] '{target_path}' is a file, not a folder. Please provide a valid directory path."
             tree_lines = [f"Project Architecture (Root: {target_path}):"]
             tree_lines.append(f"Max Depth: {max_depth}, Max Files: {max_files}")
@@ -73,7 +100,7 @@ class JarvisFileEditor:
                 "Pods", "Carthage", "DerivedData",
                 ".terraform", ".serverless", ".aws-sam",
                 "vendor", "Godeps",
-                ".history", ".sass-cache", ".eslintcache", ".stylelintcache"
+                ".history", ".sass-cache", ".eslintcache", ".stylelintcache",
             ]
             skip_extensions = [
                 ".pyc", ".pyo", ".pyd", ".pyw",
@@ -102,12 +129,12 @@ class JarvisFileEditor:
                 ".dmp", ".crash",
                 ".lnk", ".url",
                 ".nib", ".xib", ".storyboardc",
-                ".pyc.orig", ".rej"
+                ".pyc.orig", ".rej",
             ]
             blocked_filenames = {
                 ".DS_Store", "Thumbs.db", "desktop.ini",
                 ".env", ".env.local", ".env.production", ".env.development",
-                ".pid.lock", ".npmrc.lock"
+                ".pid.lock", ".npmrc.lock",
             }
 
             def walk_error(err):
@@ -139,12 +166,10 @@ class JarvisFileEditor:
                     tree_lines.append(f"  - {clean_path}")
                     count += 1
                     if count >= max_files:
-                        tree_lines.append(f"  ... (TRUNCATED: showing first {max_files} files. Increase max_files to see more.)")
-                        logger.info(f"Repo map generated with {count} files (truncated)")
+                        tree_lines.append(f"  ... (TRUNCATED: showing first {max_files} files.)")
                         return "\n".join(tree_lines)
             tree_lines.append("")
             tree_lines.append(f"[SUCCESS] Found {count} files.")
-            logger.info(f"Repo map generated with {count} files.")
             return "\n".join(tree_lines)
         except Exception as e:
             logger.error(f"Repo map error: {e}")
@@ -153,41 +178,41 @@ class JarvisFileEditor:
     def replace_block(self, file_path, search_block, replace_block):
         logger.info(f"🔧 Replacing block in file: {file_path}")
         try:
+            if not os.path.exists(file_path):
+                return f"[ERROR] File not found: '{file_path}'"
+
             norm_search = self._normalize_block(search_block)
             norm_replace = self._normalize_block(replace_block)
             if not norm_search:
-                logger.warning("Empty search block provided.")
                 return "[ERROR] Search block cannot be empty."
-            with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
-                content = f.read()
-            norm_content = content.replace("\r\n", "\n")
-            matches = norm_content.count(norm_search)
+
+            content, use_crlf = self._read_preserve_newline(file_path)
+
+            matches = content.count(norm_search)
             if matches == 0:
-                alt_search = norm_search.rstrip('\n')
-                if alt_search and norm_content.count(alt_search) > 0:
-                    matches = norm_content.count(alt_search)
-                    norm_search = alt_search
+                alt = norm_search.rstrip('\n')
+                if alt and content.count(alt) > 0:
+                    matches = content.count(alt)
+                    norm_search = alt
                 else:
-                    if norm_search != search_block:
-                        matches = norm_content.count(search_block)
-                        if matches > 0:
-                            norm_search = search_block
-                        else:
-                            logger.warning(f"Search block not found in {file_path}")
-                            return f"[ERROR] Search block not found in '{file_path}'. Ensure indentation and spacing match exactly."
+                    raw_norm = search_block.replace("\r\n", "\n").replace("\r", "\n")
+                    if raw_norm != norm_search and content.count(raw_norm) > 0:
+                        matches = content.count(raw_norm)
+                        norm_search = raw_norm
+                    else:
+                        return f"[ERROR] Search block not found in '{file_path}'. Ensure indentation and spacing match exactly."
             if matches == 0:
-                logger.warning(f"Search block not found in {file_path}")
-                return f"[ERROR] Search block not found in '{file_path}'. Ensure indentation and spacing match exactly."
-            elif matches > 1:
-                logger.warning(f"Search block found {matches} times in {file_path}")
+                return f"[ERROR] Search block not found in '{file_path}'."
+            if matches > 1:
                 return f"[ERROR] Search block found {matches} times in '{file_path}'. Please provide a larger, more unique search block."
-            new_content = norm_content.replace(norm_search, norm_replace)
-            with open(file_path, "w", encoding="utf-8", newline="\n") as f:
-                f.write(new_content)
+
+            new_content = content.replace(norm_search, norm_replace)
+            self._write_preserve_newline(file_path, new_content, use_crlf)
+
             syntax_status = self._validate_syntax(file_path)
-            if "CRITICAL SYNTAX ERROR" in syntax_status:
+            if "CRITICAL" in syntax_status:
                 logger.error(f"Syntax error after replace in {file_path}: {syntax_status}")
-                return f"[ERROR] Block replaced in '{file_path}', but broke code syntax!{syntax_status}"
+                return f"[ERROR] Block replaced in '{file_path}', but broke syntax!{syntax_status}"
             logger.info(f"✅ Block replaced successfully in {file_path}")
             return f"[SUCCESS] Block replaced cleanly in '{file_path}'.{syntax_status}"
         except Exception as e:
@@ -198,14 +223,13 @@ class JarvisFileEditor:
         logger.info(f"👀 Viewing file(s): {file_path or file_paths}")
         try:
             if not file_path and not file_paths:
-                logger.warning("View called without file path.")
                 return "[ERROR] Either 'file_path' or 'file_paths' must be provided."
             if file_paths and not isinstance(file_paths, list):
                 return "[ERROR] 'file_paths' must be a list of file paths."
             if file_path and file_paths:
                 return "[ERROR] Provide either 'file_path' (single) or 'file_paths' (list), not both."
 
-            image_extensions = {'.jpg', '.jpeg', '.png', '.webp', '.gif'}
+            image_extensions = {'.jpg', '.jpeg', '.png', '.webp', '.gif', '.bmp', '.tiff', '.tif', '.ico'}
 
             if file_path:
                 ext = os.path.splitext(file_path)[1].lower()
@@ -213,24 +237,20 @@ class JarvisFileEditor:
                     clean_path = os.path.abspath(file_path.replace("\\", "/"))
                     if not os.path.exists(clean_path):
                         return f"[ERROR] Image file '{clean_path}' does not exist."
-                    mime_type = "image/jpeg"
-                    if ext == ".png":
-                        mime_type = "image/png"
-                    elif ext == ".webp":
-                        mime_type = "image/webp"
-                    elif ext == ".gif":
-                        mime_type = "image/gif"
+                    mime_map = {
+                        '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg',
+                        '.png': 'image/png', '.webp': 'image/webp',
+                        '.gif': 'image/gif', '.bmp': 'image/bmp',
+                        '.tiff': 'image/tiff', '.tif': 'image/tiff',
+                        '.ico': 'image/x-icon',
+                    }
+                    mime_type = mime_map.get(ext, 'image/png')
                     with open(clean_path, "rb") as img_file:
                         b64_data = base64.b64encode(img_file.read()).decode('utf-8')
-                    logger.info(f"👁️ Loaded image inline for visual inspection: {clean_path}")
                     return {
                         "type": "image_payload",
-                        "data": [{
-                            "mime_type": mime_type,
-                            "data": b64_data,
-                            "path": clean_path
-                        }],
-                        "observation": f"[SUCCESS] Loaded image '{clean_path}' inline for visual inspection."
+                        "data": [{"mime_type": mime_type, "data": b64_data, "path": clean_path}],
+                        "observation": f"[SUCCESS] Loaded image '{clean_path}' inline for visual inspection.",
                     }
 
             if file_paths:
@@ -244,20 +264,18 @@ class JarvisFileEditor:
                     else:
                         text_results.append(f"=== {fp} ===\n{res}")
                 combined = "\n\n".join(text_results)
-                truncated = self._truncate_text(combined, self.MAX_VIEW_CHARS, "Combined output")
-                logger.info(f"✅ Batch view of {len(file_paths)} files done.")
+                truncated = self._truncate_text(combined, self.MAX_BATCH_VIEW_CHARS, "Combined output")
                 if image_payloads:
                     return {
                         "type": "image_payload",
                         "data": image_payloads,
-                        "observation": f"[SUCCESS] Batch view of {len(file_paths)} files:\n\n{truncated}"
+                        "observation": f"[SUCCESS] Batch view of {len(file_paths)} files:\n\n{truncated}",
                     }
                 return f"[SUCCESS] Batch view of {len(file_paths)} files:\n\n{truncated}"
 
             try:
                 file_size = os.path.getsize(file_path)
                 if file_size > self.MAX_FILE_SIZE and (start_line is None and end_line is None):
-                    logger.warning(f"File {file_path} is large ({file_size} bytes), suggest using line range.")
                     return f"[WARNING] File '{file_path}' is {file_size} bytes (max {self.MAX_FILE_SIZE}). Use line range to view partial content."
             except (OSError, FileNotFoundError):
                 pass
@@ -271,29 +289,23 @@ class JarvisFileEditor:
                 end = min(end_line, total_lines)
                 if start > end:
                     start, end = end, start
-                content = "".join(lines[start-1:end])
-                logger.info(f"Viewed lines {start}-{end} of {file_path}")
+                content = "".join(lines[start - 1:end])
                 return f"[SUCCESS] Viewed lines {start}-{end} of '{file_path}' ({total_lines} lines total):\n\n{content}"
-            elif start_line:
+            if start_line:
                 start = max(1, min(start_line, total_lines))
-                content = "".join(lines[start-1:start+9])
-                logger.info(f"Viewed 10 lines starting at {start} of {file_path}")
+                content = "".join(lines[start - 1:start + 9])
                 return f"[SUCCESS] Viewed 10 lines starting from line {start}:\n\n{content}"
-            elif end_line:
+            if end_line:
                 end = min(end_line, total_lines)
                 start = max(1, end - 9)
-                content = "".join(lines[start-1:end])
-                logger.info(f"Viewed 10 lines ending at {end} of {file_path}")
+                content = "".join(lines[start - 1:end])
                 return f"[SUCCESS] Viewed 10 lines ending at line {end}:\n\n{content}"
 
             full_content = "".join(lines)
             if len(full_content) > self.MAX_VIEW_CHARS:
                 truncated_content = self._truncate_text(full_content, self.MAX_VIEW_CHARS, f"File '{file_path}'")
-                logger.info(f"Viewed entire file {file_path} ({total_lines} lines) but truncated to {self.MAX_VIEW_CHARS} chars")
                 return f"[SUCCESS] Viewed entire file '{file_path}' ({total_lines} lines, {len(full_content)} chars) - TRUNCATED to {self.MAX_VIEW_CHARS} chars:\n\n{truncated_content}"
-            else:
-                logger.info(f"Viewed entire file {file_path} ({total_lines} lines)")
-                return f"[SUCCESS] Viewed entire file '{file_path}' ({total_lines} lines):\n\n{full_content}"
+            return f"[SUCCESS] Viewed entire file '{file_path}' ({total_lines} lines):\n\n{full_content}"
         except Exception as e:
             logger.error(f"View error: {e}")
             return f"[ERROR] Failed to view '{file_path}': {e}"
@@ -310,7 +322,6 @@ class JarvisFileEditor:
                 if not isinstance(files, list) or not files:
                     return "[ERROR] 'files' must be a non-empty list of objects with 'file_path' and 'content'."
                 if len(files) > self.MAX_CREATE_MANY_FILES:
-                    logger.warning(f"Too many files in batch: {len(files)}")
                     return f"[ERROR] Too many files ({len(files)}). Max allowed: {self.MAX_CREATE_MANY_FILES}."
                 results = []
                 for item in files:
@@ -319,24 +330,19 @@ class JarvisFileEditor:
                     if not fp:
                         results.append("[ERROR] Skipped entry: missing 'file_path'.")
                         continue
-                    res = self.create(file_path=fp, content=cont)
-                    results.append(res)
-                logger.info(f"✅ Batch creation of {len(files)} files done.")
+                    results.append(self.create(file_path=fp, content=cont))
                 return "\n".join(results)
 
             dir_name = os.path.dirname(os.path.abspath(file_path))
             if dir_name:
                 os.makedirs(dir_name, exist_ok=True)
             if len(content) > 10 * 1024 * 1024:
-                logger.warning(f"File content too large: {len(content)} bytes")
                 return f"[ERROR] File content too large ({len(content)} bytes). Max allowed 10MB."
-            with open(file_path, "w", encoding="utf-8") as f:
+            with open(file_path, "w", encoding="utf-8", newline="\n") as f:
                 f.write(content)
             syntax_status = self._validate_syntax(file_path)
-            if "CRITICAL SYNTAX ERROR" in syntax_status:
-                logger.error(f"Syntax error in created file {file_path}")
+            if "CRITICAL" in syntax_status:
                 return f"[ERROR] Created file '{file_path}', but syntax is invalid!{syntax_status}"
-            logger.info(f"✅ File created: {file_path} ({len(content)} chars)")
             return f"[SUCCESS] Created file '{file_path}' successfully ({len(content)} chars).{syntax_status}"
         except Exception as e:
             logger.error(f"Create error: {e}")

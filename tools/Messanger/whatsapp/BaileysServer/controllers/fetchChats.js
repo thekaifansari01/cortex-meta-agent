@@ -1,4 +1,4 @@
-module.exports = async (req, res, db) => {
+export default async (req, res, db) => {
     try {
         const { number, start_timestamp, end_timestamp } = req.body;
 
@@ -15,20 +15,22 @@ module.exports = async (req, res, db) => {
         }
 
         const last10Digits = cleanNumber.slice(-10);
-        const targetJidExact = `${cleanNumber}@s.whatsapp.net`;
-        const suffixJidPattern = `%${last10Digits}@s.whatsapp.net`;
+        const targetJidS = `${cleanNumber}@s.whatsapp.net`;
+        const targetJidL = `${cleanNumber}@lid`;
+        const patternS = `%${last10Digits}@s.whatsapp.net`;
+        const patternL = `%${last10Digits}@lid`;
 
-        console.log(`🔍 Fetching chats for: ${targetJidExact}`);
+        console.log(`🔍 Fetching chats for: ${targetJidS} / ${targetJidL}`);
 
         const query = `
             SELECT from_me, text, timestamp FROM Messages
-            WHERE (phone_number = ? OR phone_number LIKE ?)
+            WHERE (phone_number = ? OR phone_number LIKE ? OR phone_number = ? OR phone_number LIKE ?)
               AND timestamp BETWEEN ? AND ?
             ORDER BY timestamp DESC
             LIMIT 250
         `;
 
-        db.all(query, [targetJidExact, suffixJidPattern, start_timestamp, end_timestamp], (err, rows) => {
+        db.all(query, [targetJidS, patternS, targetJidL, patternL, start_timestamp, end_timestamp], (err, rows) => {
             if (err) {
                 console.error("❌ [DB FETCH ERROR]:", err.message);
                 return res.status(500).json({ error: "Database error" });

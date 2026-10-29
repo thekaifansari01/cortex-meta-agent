@@ -70,6 +70,10 @@ def fetch_youtube_transcript(video_url):
             return error_msg
 
         logger.info(f"✅ YouTube transcript fetched, length: {len(full_text)} chars")
+        if len(full_text) > 25000:
+            head = full_text[:18000]
+            tail = full_text[-6000:]
+            full_text = f"{head}\n\n...[TRANSCRIPT TRUNCATED - {len(full_text) - 24000} chars omitted]...\n\n{tail}"
         return f"--- YouTube Transcript ---\n{full_text}"
 
     except Exception as e:

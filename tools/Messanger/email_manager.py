@@ -35,14 +35,23 @@ ATTACHMENTS_DIR.mkdir(parents=True, exist_ok=True)
 
 MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024
 
+import threading as _threading
+_service_cache = None
+_service_lock = _threading.Lock()
+
 
 def _strip_html(html: str) -> str:
     if not html:
         return ""
     html = re.sub(r"<script[^>]*>.*?</script>", " ", html, flags=re.DOTALL | re.IGNORECASE)
     html = re.sub(r"<style[^>]*>.*?</style>", " ", html, flags=re.DOTALL | re.IGNORECASE)
+    html = re.sub(r"<br\s*/?>", "\n", html, flags=re.IGNORECASE)
+    html = re.sub(r"</p>", "\n", html, flags=re.IGNORECASE)
+    html = re.sub(r"</div>", "\n", html, flags=re.IGNORECASE)
+    html = re.sub(r"</li>", "\n", html, flags=re.IGNORECASE)
     html = re.sub(r"<[^>]+>", " ", html)
-    html = re.sub(r"\s+", " ", html)
+    html = re.sub(r"[ \t]+", " ", html)
+    html = re.sub(r"\n\s*\n+", "\n\n", html)
     return html.strip()
 
 
@@ -116,7 +125,11 @@ def authenticate_gmail(interactive: bool = True):
                 time.sleep(3)
 
     if creds and creds.valid:
-        return build('gmail', 'v1', credentials=creds, cache_discovery=False)
+        global _service_cache
+        with _service_lock:
+            if _service_cache is None:
+                _service_cache = build('gmail', 'v1', credentials=creds, cache_discovery=False)
+            return _service_cache
     logger.error("Gmail authentication failed.")
     return None
 
@@ -163,13 +176,15 @@ def send_email(to_address, subject, body, attachment_path=None):
         return False
 
 
-def _walk_payload(part, plain_body, html_body, attachments, service, msg_id):
+def _walk_payload(part, plain_body, html_body, attachments, service, msg_id, _depth=0):
+    if _depth > 20:
+        return
     mime_type = part.get("mimeType", "")
     parts = part.get("parts", [])
 
     if parts:
         for p in parts:
-            _walk_payload(p, plain_body, html_body, attachments, service, msg_id)
+            _walk_payload(p, plain_body, html_body, attachments, service, msg_id, _depth + 1)
         return
 
     body_data = part.get("body", {})
@@ -336,10 +351,17 @@ def fetch_emails_by_date(start_date, end_date=None, query=None, max_results=50, 
                         service, msg_id, full_msg
                     )
 
-                    internal_date = int(full_msg.get("internalDate", 0))
+                    internal_date_raw = full_msg.get("internalDate", 0)
                     try:
-                        date_str = datetime.fromtimestamp(internal_date / 1000).strftime("%Y-%m-%d %H:%M:%S")
-                    except (ValueError, OSError, OverflowError):
+                        internal_date = int(internal_date_raw) if internal_date_raw else 0
+                    except (ValueError, TypeError):
+                        internal_date = 0
+                    if internal_date > 0:
+                        try:
+                            date_str = datetime.fromtimestamp(internal_date / 1000).strftime("%Y-%m-%d %H:%M:%S")
+                        except (ValueError, OSError, OverflowError):
+                            date_str = "Unknown"
+                    else:
                         date_str = "Unknown"
 
                     all_emails.append({

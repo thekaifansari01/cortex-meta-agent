@@ -3,11 +3,15 @@ import logging
 from tavily import TavilyClient
 from dotenv import load_dotenv
 
-logging.basicConfig(
-    filename='Data/tavily_search.log',
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
+try:
+    os.makedirs('Data', exist_ok=True)
+    logging.basicConfig(
+        filename='Data/tavily_search.log',
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s'
+    )
+except Exception:
+    pass
 
 load_dotenv()
 
@@ -48,7 +52,7 @@ def search_web(query, max_results=5):
             
             content_to_use = raw_content if raw_content else snippet
             
-            clean_content = content_to_use.strip()[:20000]
+            clean_content = content_to_use.strip()[:5000]
             
             xml_output += f'    <source id="{i}">\n'
             xml_output += f'      <title>{title}</title>\n'

@@ -104,11 +104,11 @@ def open_any_app(apps_to_open, silent=False):
 
         except Exception as e:
             logger.warning(f"App '{name}' not found on system. Trying web fallback...")
-            fallback_url = f"https://www.{name_lower.replace(' ', '')}.com"
+            fallback_url = f"https://www.google.com/search?q={name_lower.replace(' ', '+')}"
             ok, msg = open_url(fallback_url)
             if ok:
-                opened.append(f"{name} (web)")
-                logger.info(f"Successfully opened via web fallback: {name}")
+                opened.append(f"{name} (web search)")
+                logger.info(f"Opened web search fallback for: {name}")
             else:
                 logger.error(f"Failed to open {name} completely: {msg}")
                 failed.append(name)

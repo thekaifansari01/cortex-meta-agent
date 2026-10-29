@@ -41,7 +41,9 @@ def scrape_webpage(url: str) -> str:
         
         if len(clean_markdown) > 15000:
             logger.warning("✂️ Content truncated to fit LLM Context Window.")
-            clean_markdown = clean_markdown[:15000] + "\n\n... [🔴 Content Truncated due to length]"
+            head = clean_markdown[:10000]
+            tail = clean_markdown[-4500:]
+            clean_markdown = f"{head}\n\n... [🔴 Content Truncated - {len(clean_markdown) - 14500} chars omitted from middle] ...\n\n{tail}"
             
         return f"Observation: Successfully fetched webpage content.\n\n📄 **Target URL**: {url}\n\n**Content**:\n{clean_markdown}\n\n💡 Hint: Now analyze or summarize this text to answer the user's query."
         

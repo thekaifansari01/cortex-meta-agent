@@ -1,3 +1,30 @@
+import { createRequire } from 'module';
+import { fileURLToPath } from 'url';
+import path from 'path';
+import os from 'os';
+import fs from 'fs';
+import { exec } from 'child_process';
+import express from 'express';
+import qrcode from 'qrcode';
+import pino from 'pino';
+import {
+    makeWASocket,
+    useMultiFileAuthState,
+    DisconnectReason,
+    fetchLatestBaileysVersion,
+    Browsers,
+    downloadMediaMessage
+} from '@whiskeysockets/baileys';
+
+import sendMessageController from './Controllers/sendMessage.js';
+import fetchChatsController from './Controllers/fetchChats.js';
+
+const require = createRequire(import.meta.url);
+const sqlite3 = require('sqlite3').verbose();
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
 const originalLog = console.log;
 console.log = function (...args) {
     if (args[0] && typeof args[0] === 'string' && args[0].includes('Closing session:')) {
@@ -5,26 +32,6 @@ console.log = function (...args) {
     }
     originalLog.apply(console, args);
 };
-
-const {
-    makeWASocket,
-    useMultiFileAuthState,
-    DisconnectReason,
-    fetchLatestBaileysVersion,
-    Browsers,
-    downloadMediaMessage
-} = require('@whiskeysockets/baileys');
-const express = require('express');
-const qrcode = require('qrcode');
-const fs = require('fs');
-const pino = require('pino');
-const path = require('path');
-const os = require('os');
-const sqlite3 = require('sqlite3').verbose();
-const { exec } = require('child_process');
-
-const sendMessageController = require('./Controllers/sendMessage');
-const fetchChatsController = require('./Controllers/fetchChats');
 
 process.on('uncaughtException', (err) => {
     console.error('🚨 [CRITICAL ERROR] Uncaught Exception. Engine is still running:', err.message);
@@ -41,6 +48,7 @@ let sock = null;
 let reconnectTimer = null;
 let isConnecting = false;
 let unreadAlerts = [];
+const MAX_UNREAD_ALERTS = 200;
 let sseClients = [];
 let lastQrDataUrl = null;
 let lastStatus = null;
@@ -67,6 +75,9 @@ const db = new sqlite3.Database(dbPath, (err) => {
     if (err) console.error("🚨 [DB INIT ERROR] Failed to connect to SQLite:", err.message);
 });
 
+let dbReadyResolve;
+const dbReadyPromise = new Promise((resolve) => { dbReadyResolve = resolve; });
+
 db.serialize(() => {
     db.run(`CREATE TABLE IF NOT EXISTS Messages (
         id TEXT PRIMARY KEY,
@@ -82,14 +93,37 @@ db.serialize(() => {
     db.run("CREATE INDEX IF NOT EXISTS idx_phone_timestamp ON Messages(phone_number, timestamp)", (err) => {
         if (err) console.error("⚠️ Index creation warning:", err.message);
     });
+
+    db.all("PRAGMA table_info(Messages)", (err, columns) => {
+        if (err) {
+            dbReadyResolve();
+            return;
+        }
+        const hasCreated = Array.isArray(columns) && columns.some((c) => c.name === 'created_at');
+        if (!hasCreated) {
+            db.run("ALTER TABLE Messages ADD COLUMN created_at INTEGER DEFAULT 0", (alterErr) => {
+                if (alterErr) {
+                    console.error("⚠️ [DB MIGRATION ERROR]:", alterErr.message);
+                    dbReadyResolve();
+                    return;
+                }
+                const now = Math.floor(Date.now() / 1000);
+                db.run("UPDATE Messages SET created_at = ? WHERE created_at = 0 OR created_at IS NULL", [now], (updErr) => {
+                    if (updErr) console.error("⚠️ [DB MIGRATION UPDATE ERROR]:", updErr.message);
+                    else console.log("✅ Messages.created_at column added and backfilled.");
+                    dbReadyResolve();
+                });
+            });
+        } else {
+            dbReadyResolve();
+        }
+    });
 });
 
 function dbRunAsync(sql, params) {
     return new Promise((resolve) => {
         db.run(sql, params, function (err) {
-            if (err) {
-                console.error("⚠️ [DB INSERT ERROR]:", err.message);
-            }
+            if (err) console.error("⚠️ [DB INSERT ERROR]:", err.message);
             resolve();
         });
     });
@@ -97,17 +131,40 @@ function dbRunAsync(sql, params) {
 
 function cleanupOldMessages() {
     const cutoff = Math.floor(Date.now() / 1000) - THIRTY_DAYS_SECONDS;
-    db.run("DELETE FROM Messages WHERE timestamp < ?", [cutoff], function (err) {
+    db.run("DELETE FROM Messages WHERE created_at > 0 AND created_at < ?", [cutoff], function (err) {
         if (err) {
             console.error("❌ [DB CLEANUP ERROR]:", err.message);
         } else if (this.changes > 0) {
-            console.log(`🧹 Cleaned up ${this.changes} messages older than 30 days.`);
+            console.log(`🧹 Cleaned up ${this.changes} messages added more than 30 days ago.`);
         }
     });
 }
 
-cleanupOldMessages();
-setInterval(cleanupOldMessages, 6 * 60 * 60 * 1000);
+function cleanupMediaVault() {
+    const cutoffMs = Date.now() - THIRTY_DAYS_SECONDS * 1000;
+    try {
+        const files = fs.readdirSync(mediaVaultDir);
+        let deleted = 0;
+        for (const file of files) {
+            try {
+                const fp = path.join(mediaVaultDir, file);
+                const stats = fs.statSync(fp);
+                if (stats.isFile() && stats.mtimeMs < cutoffMs) {
+                    fs.unlinkSync(fp);
+                    deleted++;
+                }
+            } catch (e) {}
+        }
+        if (deleted > 0) console.log(`🧹 Cleaned up ${deleted} old media file(s).`);
+    } catch (e) {}
+}
+
+dbReadyPromise.then(() => {
+    cleanupOldMessages();
+    cleanupMediaVault();
+    setInterval(cleanupOldMessages, 6 * 60 * 60 * 1000);
+    setInterval(cleanupMediaVault, 6 * 60 * 60 * 1000);
+});
 
 function broadcast(payload) {
     lastStatus = payload;
@@ -115,11 +172,17 @@ function broadcast(payload) {
         lastQrDataUrl = payload.qr;
     }
     const data = `data: ${JSON.stringify(payload)}\n\n`;
+    const deadClients = [];
     sseClients.forEach((client) => {
         try {
             client.res.write(data);
-        } catch (e) {}
+        } catch (e) {
+            deadClients.push(client);
+        }
     });
+    if (deadClients.length > 0) {
+        sseClients = sseClients.filter((c) => !deadClients.includes(c));
+    }
 }
 
 function openBrowser(url) {
@@ -132,11 +195,21 @@ function openBrowser(url) {
 }
 
 function normalizeJid(msgKey) {
-    const rawJid = (msgKey.remoteJidAlt && msgKey.remoteJidAlt.endsWith('@s.whatsapp.net'))
-        ? msgKey.remoteJidAlt
-        : msgKey.remoteJid;
-    if (!rawJid) return null;
-    return rawJid.replace(/:\d+@/, '@');
+    if (!msgKey) return null;
+    const alt = msgKey.remoteJidAlt;
+    const main = msgKey.remoteJid;
+    let chosen = null;
+    if (alt && typeof alt === 'string' && alt.endsWith('@s.whatsapp.net')) {
+        chosen = alt;
+    } else if (main && typeof main === 'string' && main.endsWith('@s.whatsapp.net')) {
+        chosen = main;
+    } else if (alt && typeof alt === 'string') {
+        chosen = alt;
+    } else if (main && typeof main === 'string') {
+        chosen = main;
+    }
+    if (!chosen) return null;
+    return chosen.replace(/:\d+@/, '@');
 }
 
 function extractMessageText(messageObj) {
@@ -207,7 +280,9 @@ const store = {
                         const mediaContainer = extractMediaContainer(msg.message);
                         let mediaTag = "";
 
-                        if (mediaContainer && !fromMe && !isBulkSync && timestamp >= SCRIPT_START_TIME) {
+                        const recentMediaCutoff = SCRIPT_START_TIME - 86400;
+                        const shouldDownloadMedia = mediaContainer && !fromMe && (!isBulkSync || timestamp >= recentMediaCutoff);
+                        if (shouldDownloadMedia) {
                             try {
                                 const buffer = await downloadMediaMessage(
                                     msg,
@@ -240,13 +315,17 @@ const store = {
                         if (!fromMe && !isBulkSync && timestamp >= SCRIPT_START_TIME) {
                             const senderName = msg.pushName || `Unknown ${jid.split('@')[0]}`;
                             unreadAlerts.push(`${senderName}: ${fullTextForDb}`);
+                            if (unreadAlerts.length > MAX_UNREAD_ALERTS) {
+                                unreadAlerts = unreadAlerts.slice(-MAX_UNREAD_ALERTS);
+                            }
                         }
 
                         validMessageCount++;
                         uniqueChats.add(jid.split('@')[0]);
 
-                        const insertQuery = `INSERT OR IGNORE INTO Messages (id, phone_number, text, timestamp, from_me) VALUES (?, ?, ?, ?, ?)`;
-                        await dbRunAsync(insertQuery, [id, jid, fullTextForDb, timestamp, fromMe]);
+                        const nowSec = Math.floor(Date.now() / 1000);
+                        const insertQuery = `INSERT OR IGNORE INTO Messages (id, phone_number, text, timestamp, from_me, created_at) VALUES (?, ?, ?, ?, ?, ?)`;
+                        await dbRunAsync(insertQuery, [id, jid, fullTextForDb, timestamp, fromMe, nowSec]);
                     } catch (msgErr) {}
                 }
 
@@ -364,8 +443,16 @@ async function connectToWhatsApp() {
                     const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
 
                     if (statusCode === DisconnectReason.loggedOut) {
-                        console.log('❌ [LOGGED OUT] Device has been logged out from WhatsApp Web. Please delete session folder and rescan.');
+                        console.log('❌ [LOGGED OUT] Device has been logged out from WhatsApp Web. Delete the session folder and restart to rescan.');
                         broadcast({ type: 'logged_out' });
+                        try {
+                            if (sock) {
+                                sock.ev.removeAllListeners();
+                                sock.ws?.close();
+                            }
+                        } catch (cleanupErr) {}
+                        sock = null;
+                        isConnecting = false;
                         return;
                     } else if (statusCode === 440) {
                         console.log('⚠️ [CONFLICT - 440] WhatsApp Web is open elsewhere. Jarvis is waiting 10s to avoid spam...');
@@ -387,6 +474,7 @@ async function connectToWhatsApp() {
                     }
                 } else if (connection === 'open') {
                     lastQrDataUrl = null;
+                    browserOpenedOnce = false;
                     console.log('\n✅ JARVIS WHATSAPP ENGINE IS ONLINE (MODULAR & SQLITE MODE)!\n');
                     broadcast({ type: 'connected' });
                 }
@@ -419,9 +507,13 @@ app.get('/qr-events', (req, res) => {
     sseClients.push(client);
 
     if (lastQrDataUrl && (!lastStatus || lastStatus.type === 'waiting_scan')) {
-        res.write(`data: ${JSON.stringify({ type: 'waiting_scan', qr: lastQrDataUrl })}\n\n`);
+        try {
+            res.write(`data: ${JSON.stringify({ type: 'waiting_scan', qr: lastQrDataUrl })}\n\n`);
+        } catch (e) {}
     } else if (lastStatus) {
-        res.write(`data: ${JSON.stringify(lastStatus)}\n\n`);
+        try {
+            res.write(`data: ${JSON.stringify(lastStatus)}\n\n`);
+        } catch (e) {}
     }
 
     const keepAlive = setInterval(() => {
