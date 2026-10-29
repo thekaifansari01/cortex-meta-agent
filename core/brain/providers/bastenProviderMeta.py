@@ -344,6 +344,7 @@ class BastenProviderMeta(BaseLLMProvider):
                                             }
 
                                         if delta.get("tool_calls"):
+                                            tc_delta_str = ""
                                             for tc in delta["tool_calls"]:
                                                 idx = tc.get("index", 0)
                                                 if idx not in accumulated_tool_calls:
@@ -356,10 +357,21 @@ class BastenProviderMeta(BaseLLMProvider):
                                                     accumulated_tool_calls[idx][
                                                         "name"
                                                     ] += fn["name"]
+                                                    tc_delta_str += fn["name"]
                                                 if fn.get("arguments"):
                                                     accumulated_tool_calls[idx][
                                                         "arguments"
                                                     ] += fn["arguments"]
+                                                    tc_delta_str += fn["arguments"]
+                                            if tc_delta_str:
+                                                yield {
+                                                    "content": "",
+                                                    "reasoning_content": "",
+                                                    "tool_calls": [],
+                                                    "tool_calls_delta": tc_delta_str,
+                                                    "provider": "basten",
+                                                    "error": None,
+                                                }
 
                                 except json.JSONDecodeError:
                                     pass

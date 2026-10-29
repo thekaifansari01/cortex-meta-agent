@@ -298,6 +298,7 @@ class CustomProvider(BaseLLMProvider):
                                             }
                                         
                                         if delta.get('tool_calls'):
+                                            tc_delta_str = ""
                                             for tc in delta['tool_calls']:
                                                 idx = tc.get('index', 0)
                                                 if idx not in accumulated_tool_calls:
@@ -305,8 +306,19 @@ class CustomProvider(BaseLLMProvider):
                                                 fn = tc.get('function', {})
                                                 if fn.get('name'):
                                                     accumulated_tool_calls[idx]["name"] += fn['name']
+                                                    tc_delta_str += fn['name']
                                                 if fn.get('arguments'):
                                                     accumulated_tool_calls[idx]["arguments"] += fn['arguments']
+                                                    tc_delta_str += fn['arguments']
+                                            if tc_delta_str:
+                                                yield {
+                                                    "content": "",
+                                                    "reasoning_content": "",
+                                                    "tool_calls": [],
+                                                    "tool_calls_delta": tc_delta_str,
+                                                    "provider": "custom",
+                                                    "error": None
+                                                }
                                                 
                                 except json.JSONDecodeError:
                                     pass
