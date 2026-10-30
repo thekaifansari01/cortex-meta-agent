@@ -21,6 +21,14 @@ try:
 except Exception:
     TOKENIZER = None
 
+_REPEATABLE_GUI_ACTIONS = {
+    "observe",
+    "scroll_down",
+    "scroll_up",
+    "press_key",
+    "hotkey",
+}
+
 
 def make_result(response, **kwargs):
     base = {
@@ -90,6 +98,17 @@ def optimize_observation(text: str, max_chars: int = 10000) -> str:
     )
 
 
+def _collapse_stale_gui_observations(scratchpad: str) -> str:
+    pattern = re.compile(
+        r"(DETECTED ELEMENTS:\n)(?:.*?)(?=\n\nWORKFLOW:|\n</Result>)",
+        flags=re.DOTALL,
+    )
+    return pattern.sub(
+        r"\1[Stale UI element list from earlier step omitted - refer ONLY to the latest observe output]",
+        scratchpad,
+    )
+
+
 def _enforce_scratchpad_limit(scratchpad: str, max_chars: int) -> str:
     if not max_chars or max_chars <= 0:
         return scratchpad
@@ -127,14 +146,16 @@ def _is_failure_prefix(text: str) -> bool:
     if payload.startswith("Observation:"):
         payload = payload[len("Observation:"):].strip()
 
-    head = payload[:200]
+    head = payload[:250]
     failure_markers = (
         "[ERROR]",
         "[FAILED]",
         "[CRITICAL SYNTAX ERROR",
         "Traceback (most recent call last)",
         "Error ->",
+        "Error:",
         "Failed to ",
+        "Unknown GUI action",
         "❌",
         "🚫",
         "Python script failed",
@@ -146,7 +167,13 @@ def _is_failure_prefix(text: str) -> bool:
         "SSH command timed out",
         "SSH execution crashed",
     )
-    return head.startswith(failure_markers)
+    if head.startswith(failure_markers):
+        return True
+
+    if "CLICK REJECTED" in head:
+        return True
+
+    return False
 
 
 def update_confirmed_facts(
@@ -176,6 +203,12 @@ def update_confirmed_facts(
     elif action_key in ("email_action", "whatsapp_action", "telegram_action"):
         clean_summary = obs_str.replace("Observation:", "").replace("\n", " ").strip()
         facts_ledger[f"Communication ({action_key} {action_detail[:25]})"] = clean_summary[:300]
+    elif action_key == "system_controller":
+        clean_sys = obs_str.replace("Observation:", "").replace("\n", " ").strip()
+        facts_ledger[f"System ({action_detail[:30]})"] = clean_sys[:200]
+    elif action_key == "gui_controller":
+        first_line = obs_str.replace("Observation:", "").strip().splitlines()[0]
+        facts_ledger[f"GUI ({action_detail[:30]})"] = first_line[:200]
 
 
 def run_agentic_loop(
@@ -247,6 +280,7 @@ User Command: "{raw_command}"
     step = 0
     total_loop_tokens = 0
     start_time = time.time()
+    gui_budget_extended = False
 
     completed_actions = set()
     confirmed_facts = {}
@@ -575,7 +609,7 @@ If the <Mission> is fully complete, call 'complete_task'.
                                 ai_response["response"] = func_args.get(
                                     "response", "Task completed sir."
                                 )
-                            else:
+                            elif func_name not in ai_response:
                                 ai_response[func_name] = func_args
 
                     ai_response["thought"] = thought_text
@@ -843,19 +877,36 @@ If the <Mission> is fully complete, call 'complete_task'.
                             if gui_action == "observe":
                                 current_detail = "Observing Screen"
                             elif gui_action in ["click_by_id", "double_click_by_id", "right_click_by_id"]:
-                                current_detail = f"Clicking #{value.get('element_id', '?')}"
+                                current_detail = f"Clicking #{value.get('element_id', '?')} ({value.get('expected_text', '')[:20]})"
                             elif gui_action == "type":
-                                current_detail = "Typing Text"
+                                current_detail = f"Typing '{str(value.get('text', ''))[:20]}'"
                             elif gui_action == "drag_and_drop":
                                 current_detail = "Dragging"
                             elif gui_action in ["press_key", "hotkey"]:
-                                current_detail = "Pressing Keys"
+                                current_detail = f"Keys: {value.get('key') or value.get('keys')}"
                             elif gui_action in ["scroll_down", "scroll_up"]:
-                                current_detail = "Scrolling"
+                                current_detail = f"Scrolling ({gui_action})"
                             else:
                                 current_detail = f"GUI: {gui_action}"
 
                         action_details_list.append(current_detail)
+
+            if "gui_controller" in executed_tools and not gui_budget_extended:
+                gui_budget_extended = True
+                if max_steps < 25:
+                    max_steps = 25
+                    panic_step = max_steps - 2
+                    dynamic_agent_prompt = build_agentic_system_prompt(
+                        base_agent_prompt=AGENT_SYSTEM_PROMPT,
+                        domains=active_domains,
+                        raw_command=raw_command,
+                        context=context,
+                        max_steps=max_steps,
+                        panic_step=panic_step,
+                    )
+                if timeout_seconds < 240:
+                    timeout_seconds = 240
+                logger.info(f"🖥️ GUI task detected: Extended step budget to {max_steps} steps and timeout to {timeout_seconds}s.")
 
             action_key = " | ".join(executed_tools) if executed_tools else ""
             action_detail = " | ".join(action_details_list) if action_details_list else ""
@@ -993,6 +1044,16 @@ ACT IMMEDIATELY — no further deliberation.</Result>
                 t_val = ai_response.get(t_key, {})
                 if not isinstance(t_val, dict):
                     t_val = {}
+                if t_key == "gui_controller":
+                    gui_act = str(t_val.get("action", "")).strip()
+                    if gui_act in _REPEATABLE_GUI_ACTIONS:
+                        continue
+                    fp = f"{t_key}:{str(t_val)[:120]}"
+                    if f"{fp} -> [NO_SCREEN_CHANGE - DO NOT REPEAT]" in completed_actions:
+                        duplicate_tool = t_key
+                        break
+                    continue
+
                 fp = f"{t_key}:{str(t_val)[:100]}"
                 if (f"{fp} -> [SUCCESS]" in completed_actions or
                     f"{fp} -> [SUCCESS - USER EDITED CONTENT IN UI AND SENT, DO NOT RESEND]" in completed_actions):
@@ -1001,7 +1062,7 @@ ACT IMMEDIATELY — no further deliberation.</Result>
 
             observation = None
             if duplicate_tool:
-                observation = f"Observation: [ERROR] Duplicate action blocked. The tool '{duplicate_tool}' was already executed successfully with identical parameters in a previous step. Do NOT retry. Either call 'complete_task' if the mission is complete, or choose a genuinely different action."
+                observation = f"Observation: [ERROR] Duplicate action blocked. The tool '{duplicate_tool}' was already executed with identical parameters without further effect. Do NOT retry the same action. Call 'observe' if using GUI, choose a different element/approach, or call 'complete_task' if finished."
                 had_system_failure = True
                 logger.warning(f"⚠️ Duplicate tool call blocked: {duplicate_tool}")
                 if not silent:
@@ -1078,6 +1139,7 @@ ACT IMMEDIATELY — no further deliberation.</Result>
                                 obs_text = str(observation)
                                 is_user_cancelled = "[USER_CANCELLED]" in obs_text
                                 is_user_edited = "[NOTE: User explicitly edited" in obs_text
+                                is_gui_no_change = "WARNING: Screen looks IDENTICAL" in obs_text
                                 if is_user_cancelled:
                                     had_user_cancel = True
                                 if is_user_edited:
@@ -1089,7 +1151,25 @@ ACT IMMEDIATELY — no further deliberation.</Result>
                                     if not isinstance(t_val, dict):
                                         t_val = {}
                                     action_fingerprint = f"{t_key}:{str(t_val)[:100]}"
-                                    if is_user_cancelled:
+                                    if t_key == "gui_controller":
+                                        gui_act = str(t_val.get("action", "")).strip()
+                                        gui_fp = f"{t_key}:{str(t_val)[:120]}"
+                                        if gui_act == "observe":
+                                            scratchpad = _collapse_stale_gui_observations(scratchpad)
+                                            completed_actions = {
+                                                item for item in completed_actions
+                                                if not item.startswith("gui_controller:")
+                                            }
+                                            update_confirmed_facts(confirmed_facts, t_key, action_detail, observation)
+                                        elif is_gui_no_change:
+                                            completed_actions.add(f"{gui_fp} -> [NO_SCREEN_CHANGE - DO NOT REPEAT]")
+                                        else:
+                                            completed_actions = {
+                                                item for item in completed_actions
+                                                if not item.endswith("[NO_SCREEN_CHANGE - DO NOT REPEAT]")
+                                            }
+                                            update_confirmed_facts(confirmed_facts, t_key, action_detail, observation)
+                                    elif is_user_cancelled:
                                         completed_actions.add(f"{action_fingerprint} -> [CANCELLED BY USER - DO NOT RETRY]")
                                         confirmed_facts[f"User Cancelled ({t_key})"] = "User explicitly cancelled sending this message from the UI preview. Do NOT retry."
                                     elif is_user_edited:

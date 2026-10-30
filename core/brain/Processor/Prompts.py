@@ -455,13 +455,14 @@ def get_native_tools():
                         "[WHEN TO USE]: Use ONLY when the user explicitly requests visual interaction with the screen.\n"
                         "[WHEN NOT TO USE]: NEVER use this for background tasks, file editing, terminal commands, or merely opening/closing apps (use 'system_controller' to launch apps first).\n"
                         "[CRITICAL WORKFLOW — ZERO HALLUCINATION]:\n"
-                        "1. OBSERVE FIRST: You MUST ALWAYS call action='observe' before any click. You will receive a screenshot with numbered red boxes (yellow badges) over every detected UI element, plus a text list mapping each ID -> element text + center coordinate.\n"
-                        "2. CLICK BY ID (MANDATORY): If the target element exists in the numbered list, you MUST use action='click_by_id' with element_id=<number> AND expected_text='<exact label from list>'. The system verifies expected_text matches the actual element label. If mismatched, click is REJECTED with a hint. Never skip expected_text.\n"
-                        "3. RAW CLICK FALLBACK: Use action='click' with x,y ONLY when the target is NOT in the numbered list (e.g., canvas, image region, custom drawing, game area).\n"
-                        "4. VERIFY: After every action, call 'observe' again to confirm the UI changed as expected.\n"
-                        "5. UI LAG: If clicking opens a heavy app/menu, set 'wait_after_action' (2.0-4.0) to let the UI load.\n"
-                        "6. DRAG: For 'drag_and_drop' provide start_x, start_y, end_x, end_y.\n"
-                        "7. DENSE UI: On screens with many similar labels (Calculator, keypads), verify the element_id matches the exact label via expected_text to avoid wrong clicks."
+                        "1. OBSERVE FIRST: You MUST ALWAYS call action='observe' before any click or type action on a new screen. You will receive a screenshot with numbered boxes and yellow badges over every detected UI element, plus a text list mapping each ID -> element text + center coordinate.\n"
+                        "2. CLICK BY ID (MANDATORY): If the target element exists in the numbered list, you MUST use action='click_by_id' (or 'double_click_by_id' / 'right_click_by_id') with element_id=<number> AND expected_text='<exact label from list>'. The system verifies expected_text matches the actual element label. Never skip expected_text.\n"
+                        "3. TYPE WITH ID: For typing into an input field visible in the observe list, use action='type' with element_id=<number>, expected_text='<exact label>', text='<text to type>', clear_first=true/false, and press_enter=true/false.\n"
+                        "4. RAW CLICK FALLBACK: Use action='click' with x,y ONLY when the target is NOT in the numbered list (e.g., canvas, image region, custom drawing, game area).\n"
+                        "5. VERIFY: After every action, call 'observe' again to confirm the UI changed as expected.\n"
+                        "6. UI LAG: If clicking opens a heavy app/menu, set 'wait_after_action' (2.0-4.0) to let the UI load.\n"
+                        "7. DRAG: For 'drag_and_drop' provide either start_element_id and end_element_id OR start_x, start_y, end_x, end_y.\n"
+                        "8. DENSE UI: On screens with many similar labels (Calculator, keypads), always verify element_id matches the exact label via expected_text."
                     ),
                     parameters=types.Schema(
                         type=types.Type.OBJECT,
@@ -472,26 +473,42 @@ def get_native_tools():
                             ),
                             "element_id": types.Schema(
                                 type=types.Type.INTEGER,
-                                description="PREFERRED OVER x/y. The numbered element ID from the most recent 'observe'. Required for 'click_by_id', 'double_click_by_id', 'right_click_by_id'. MUST be paired with 'expected_text'."
+                                description="PREFERRED OVER x/y. The numbered element ID from the most recent 'observe'. Supported for 'click_by_id', 'double_click_by_id', 'right_click_by_id', 'type', 'scroll_down', and 'scroll_up'. Pair with 'expected_text'."
                             ),
                             "expected_text": types.Schema(
                                 type=types.Type.STRING,
-                                description="SAFETY CHECK. The EXACT visible label of the target element as it appears in the observe list (e.g., \"7\", \"Add\", \"Save\"). System verifies this matches element_id's actual label before clicking. If mismatch, click is REJECTED. Always provide this when using click_by_id / double_click_by_id / right_click_by_id."
+                                description="SAFETY CHECK. The EXACT visible label of the target element as it appears in the latest observe list (e.g., \"7\", \"Add\", \"Save\"). System verifies this matches element_id's actual label before clicking or typing."
                             ),
                             "x": types.Schema(
                                 type=types.Type.INTEGER,
-                                description="Only for raw 'click'/'hover' when target is NOT in the numbered element list. Otherwise use element_id."
+                                description="Only for raw 'click'/'hover'/'type'/'scroll' when target is NOT in the numbered element list. Otherwise use element_id."
                             ),
                             "y": types.Schema(
                                 type=types.Type.INTEGER,
-                                description="Only for raw 'click'/'hover' when target is NOT in the numbered element list. Otherwise use element_id."
+                                description="Only for raw 'click'/'hover'/'type'/'scroll' when target is NOT in the numbered element list. Otherwise use element_id."
                             ),
-                            "start_x": types.Schema(type=types.Type.INTEGER, description="Required ONLY for 'drag_and_drop'."),
-                            "start_y": types.Schema(type=types.Type.INTEGER, description="Required ONLY for 'drag_and_drop'."),
-                            "end_x": types.Schema(type=types.Type.INTEGER, description="Required ONLY for 'drag_and_drop'."),
-                            "end_y": types.Schema(type=types.Type.INTEGER, description="Required ONLY for 'drag_and_drop'."),
-                            "text": types.Schema(type=types.Type.STRING, description="Required for 'type'."),
-                            "key": types.Schema(type=types.Type.STRING, description="Required for 'press_key'. Examples: 'enter', 'tab', 'esc', 'win'."),
+                            "start_element_id": types.Schema(
+                                type=types.Type.INTEGER,
+                                description="Optional for 'drag_and_drop': Element ID from the observe list to start dragging from."
+                            ),
+                            "end_element_id": types.Schema(
+                                type=types.Type.INTEGER,
+                                description="Optional for 'drag_and_drop': Element ID from the observe list to drop onto."
+                            ),
+                            "start_x": types.Schema(type=types.Type.INTEGER, description="For 'drag_and_drop' if start_element_id is not used."),
+                            "start_y": types.Schema(type=types.Type.INTEGER, description="For 'drag_and_drop' if start_element_id is not used."),
+                            "end_x": types.Schema(type=types.Type.INTEGER, description="For 'drag_and_drop' if end_element_id is not used."),
+                            "end_y": types.Schema(type=types.Type.INTEGER, description="For 'drag_and_drop' if end_element_id is not used."),
+                            "text": types.Schema(type=types.Type.STRING, description="Required for 'type'. The exact string to type."),
+                            "clear_first": types.Schema(
+                                type=types.Type.BOOLEAN,
+                                description="Optional for 'type'. Set true to select all and clear existing text in the field before typing. Default false."
+                            ),
+                            "press_enter": types.Schema(
+                                type=types.Type.BOOLEAN,
+                                description="Optional for 'type'. Set true to press Enter immediately after typing. Default false."
+                            ),
+                            "key": types.Schema(type=types.Type.STRING, description="Required for 'press_key'. Examples: 'enter', 'tab', 'esc', 'win', 'backspace'."),
                             "keys": types.Schema(
                                 type=types.Type.ARRAY,
                                 items=types.Schema(type=types.Type.STRING),

@@ -3,9 +3,11 @@ import time
 import base64
 import tempfile
 import ctypes
+from ctypes import wintypes
 import hashlib
 import threading
 import difflib
+from collections import deque
 import pyautogui
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
@@ -33,8 +35,9 @@ _ocr_lock = threading.Lock()
 _LAST_ELEMENTS = []
 _LAST_SCREEN_HASH = None
 _CACHE_LOCK = threading.Lock()
-_MAX_ELEMENTS = 200
+_MAX_ELEMENTS = 300
 _DEFAULT_POST_ACTION_WAIT = 0.5
+_SELF_PID = os.getpid()
 
 _INTERACTIVE_UIA_ROLES = {
     "ButtonControl", "EditControl", "HyperlinkControl", "MenuItemControl",
@@ -43,11 +46,58 @@ _INTERACTIVE_UIA_ROLES = {
     "SliderControl", "SplitButtonControl", "TextControl", "DocumentControl",
 }
 
-_CONTAINER_UIA_ROLES = {
-    "WindowControl", "PaneControl", "GroupControl", "CustomControl",
-    "ToolBarControl", "MenuBarControl", "StatusBarControl", "ScrollBarControl",
+_PURE_CONTAINER_UIA_ROLES = {
+    "WindowControl", "PaneControl", "GroupControl", "ToolBarControl",
+    "MenuBarControl", "StatusBarControl", "ScrollBarControl",
     "TitleBarControl", "HeaderControl",
 }
+
+_SYMBOL_EQUIVALENTS = {
+    "×": "*",
+    "✕": "*",
+    "✖": "*",
+    "÷": "/",
+    "−": "-",
+    "–": "-",
+    "—": "-",
+}
+
+
+class _GUITHREADINFO(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", wintypes.DWORD),
+        ("flags", wintypes.DWORD),
+        ("hwndActive", wintypes.HWND),
+        ("hwndFocus", wintypes.HWND),
+        ("hwndCapture", wintypes.HWND),
+        ("hwndMenuOwner", wintypes.HWND),
+        ("hwndMoveSize", wintypes.HWND),
+        ("hwndCaret", wintypes.HWND),
+        ("rcCaret", wintypes.RECT),
+    ]
+
+
+def _get_gui_focus_signature():
+    try:
+        fg_hwnd = ctypes.windll.user32.GetForegroundWindow()
+        gti = _GUITHREADINFO()
+        gti.cbSize = ctypes.sizeof(_GUITHREADINFO)
+        if ctypes.windll.user32.GetGUIThreadInfo(0, ctypes.byref(gti)):
+            return (
+                fg_hwnd,
+                gti.hwndActive,
+                gti.hwndFocus,
+                gti.hwndCapture,
+                gti.hwndMenuOwner,
+                gti.hwndCaret,
+                gti.rcCaret.left,
+                gti.rcCaret.top,
+                gti.rcCaret.right,
+                gti.rcCaret.bottom,
+            )
+        return (fg_hwnd,)
+    except Exception:
+        return None
 
 
 def _get_ocr():
@@ -106,9 +156,18 @@ def warmup_gui_system():
                 pass
 
 
+def _mask_clock_region(img):
+    masked = img.copy()
+    w, h = masked.size
+    draw = ImageDraw.Draw(masked)
+    draw.rectangle([max(0, w - 160), max(0, h - 52), w, h], fill=(0, 0, 0))
+    return masked
+
+
 def _compute_screen_hash(img):
-    small = img.resize((384, 216), _RESAMPLE_BILINEAR)
-    quantized = small.point(lambda p: (p // 4) * 4)
+    masked = _mask_clock_region(img)
+    small = masked.resize((384, 216), _RESAMPLE_BILINEAR)
+    quantized = small.point(lambda p: (p // 6) * 6)
     return hashlib.md5(quantized.tobytes()).hexdigest()
 
 
@@ -119,11 +178,20 @@ def _capture_rgb():
         return None
 
 
-def _has_screen_changed(before_img, after_img, target_xy=None):
+def _has_screen_changed(before_img, after_img, target_xy=None, before_sig=None, after_sig=None):
+    if before_sig is not None and after_sig is not None and before_sig != after_sig:
+        return True
     if before_img is None or after_img is None:
         return True
     if _compute_screen_hash(before_img) != _compute_screen_hash(after_img):
         return True
+
+    b_masked = np.asarray(_mask_clock_region(before_img), dtype=np.float32)
+    a_masked = np.asarray(_mask_clock_region(after_img), dtype=np.float32)
+    full_diff = np.abs(b_masked - a_masked)
+    if np.mean(full_diff > 18.0) > 0.0004:
+        return True
+
     if target_xy is not None:
         tx, ty = target_xy
         w, h = before_img.size
@@ -133,7 +201,7 @@ def _has_screen_changed(before_img, after_img, target_xy=None):
             b_arr = np.asarray(before_img.crop((x1, y1, x2, y2)), dtype=np.float32)
             a_arr = np.asarray(after_img.crop((x1, y1, x2, y2)), dtype=np.float32)
             diff = np.abs(b_arr - a_arr)
-            if diff.mean() > 0.9 or diff.max() > 24.0:
+            if diff.mean() > 1.1 or np.mean(diff > 20.0) > 0.005:
                 return True
     return False
 
@@ -167,7 +235,10 @@ def _detect_text_elements(img):
                 try:
                     box, text, conf = item[0], item[1], float(item[2])
                     clean_text = str(text).strip()
-                    if conf < 0.45 or not clean_text:
+                    if not clean_text:
+                        continue
+                    min_conf = 0.32 if len(clean_text) <= 2 else 0.45
+                    if conf < min_conf:
                         continue
                     xs = [p[0] / scale for p in box]
                     ys = [p[1] / scale for p in box]
@@ -175,8 +246,26 @@ def _detect_text_elements(img):
                     y1 = max(0, min(orig_h, int(round(min(ys)))))
                     x2 = max(0, min(orig_w, int(round(max(xs)))))
                     y2 = max(0, min(orig_h, int(round(max(ys)))))
-                    if (x2 - x1) < 3 or (y2 - y1) < 3:
+                    bw = x2 - x1
+                    bh = y2 - y1
+                    if bw < 3 or bh < 3:
                         continue
+
+                    if "  " in clean_text and bw > bh * 5.0:
+                        parts = [p.strip() for p in clean_text.split("  ") if p.strip()]
+                        if len(parts) > 1:
+                            step_w = bw / len(parts)
+                            for idx, part in enumerate(parts):
+                                px1 = int(round(x1 + idx * step_w))
+                                px2 = int(round(x1 + (idx + 1) * step_w))
+                                elements.append({
+                                    "text": part,
+                                    "bbox": (px1, y1, px2, y2),
+                                    "role": "text",
+                                    "source": "ocr",
+                                })
+                            continue
+
                     elements.append({
                         "text": clean_text,
                         "bbox": (x1, y1, x2, y2),
@@ -191,11 +280,26 @@ def _detect_text_elements(img):
     return elements
 
 
-def _extract_uia_label(ctrl, role):
+def _humanize_auto_id(auto_id):
+    if not auto_id or auto_id.isdigit():
+        return ""
+    cleaned = auto_id.replace("_", " ").replace("-", " ")
+    out = []
+    for ch in cleaned:
+        if ch.isupper() and out and out[-1].islower():
+            out.append(" ")
+        out.append(ch)
+    res = "".join(out).strip()
+    if len(res) < 2 or res.isdigit():
+        return ""
+    return res[:50]
+
+
+def _extract_uia_label(ctrl, role, w, h):
     try:
         name = (ctrl.Name or "").strip()
         if name:
-            return name
+            return name[:80]
     except Exception:
         pass
 
@@ -214,6 +318,9 @@ def _extract_uia_label(ctrl, role):
             leg_name = (legacy.Name or "").strip()
             if leg_name:
                 return leg_name[:70]
+            leg_desc = (legacy.Description or "").strip()
+            if leg_desc:
+                return leg_desc[:70]
     except Exception:
         pass
 
@@ -224,51 +331,60 @@ def _extract_uia_label(ctrl, role):
     except Exception:
         pass
 
+    if role in ("ButtonControl", "SplitButtonControl", "MenuItemControl", "TabItemControl", "HyperlinkControl", "ListItemControl"):
+        try:
+            for sub in ctrl.GetChildren()[:4]:
+                sub_name = (sub.Name or "").strip()
+                if sub_name:
+                    return sub_name[:70]
+                sub_help = (sub.HelpText or "").strip()
+                if sub_help:
+                    return sub_help[:70]
+        except Exception:
+            pass
+
     try:
         auto_id = (ctrl.AutomationId or "").strip()
     except Exception:
         auto_id = ""
 
+    human_id = _humanize_auto_id(auto_id)
+
     if role in ("EditControl", "ComboBoxControl", "DocumentControl"):
-        if auto_id and not auto_id.isdigit():
-            return f"Input ({auto_id})"
+        if human_id:
+            return f"Input ({human_id})"
         return "Input Field"
 
-    if role in ("ButtonControl", "SplitButtonControl", "CheckBoxControl", "RadioButtonControl"):
-        if auto_id and not auto_id.isdigit():
-            return auto_id
+    if role in ("ButtonControl", "SplitButtonControl", "CheckBoxControl", "RadioButtonControl", "TabItemControl", "MenuItemControl"):
+        if human_id:
+            return human_id
+        if 12 <= w <= 96 and 12 <= h <= 72:
+            clean_role = role.replace("Control", "")
+            return f"Icon {clean_role}"
 
     return ""
 
 
-def _detect_uia_elements(screen_size):
-    try:
-        import uiautomation as auto
-    except ImportError:
-        return []
+def _is_point_occluded(cx, cy, occluded_rects):
+    for (ox1, oy1, ox2, oy2) in occluded_rects:
+        if ox1 <= cx <= ox2 and oy1 <= cy <= oy2:
+            return True
+    return False
 
-    hr = None
-    try:
-        hr = ctypes.windll.ole32.CoInitialize(None)
-    except Exception:
-        pass
 
-    screen_w, screen_h = screen_size
-    screen_area = max(1, screen_w * screen_h)
-    elements = []
-    seen_keys = set()
-    deadline = time.perf_counter() + 1.8
-
-    def walk(ctrl, depth=0, max_depth=16):
-        if depth > max_depth or len(elements) >= 240 or time.perf_counter() > deadline:
-            return
+def _scan_window_bfs(win_ctrl, screen_w, screen_h, screen_area, occluded_rects, elements, seen_keys, deadline, max_elements=340):
+    queue = deque([(win_ctrl, 0)])
+    while queue and len(elements) < max_elements and time.perf_counter() <= deadline:
+        ctrl, depth = queue.popleft()
+        if depth > 14:
+            continue
         try:
             children = ctrl.GetChildren()
         except Exception:
-            return
+            continue
 
         for child in children:
-            if time.perf_counter() > deadline or len(elements) >= 240:
+            if time.perf_counter() > deadline or len(elements) >= max_elements:
                 break
             try:
                 try:
@@ -294,16 +410,25 @@ def _detect_uia_elements(screen_size):
                 role = getattr(child, "ControlTypeName", "") or "Control"
                 area = w * h
 
-                if role in _CONTAINER_UIA_ROLES and area > 0.12 * screen_area:
-                    walk(child, depth + 1, max_depth)
+                if depth < 14:
+                    queue.append((child, depth + 1))
+
+                if role in _PURE_CONTAINER_UIA_ROLES:
                     continue
 
-                if role == "DocumentControl" and area > 0.20 * screen_area:
-                    walk(child, depth + 1, max_depth)
+                if role == "DocumentControl" and area > 0.25 * screen_area:
                     continue
 
-                if role in _INTERACTIVE_UIA_ROLES or area <= 0.08 * screen_area:
-                    label = _extract_uia_label(child, role)
+                if role == "CustomControl" and area > 0.04 * screen_area:
+                    continue
+
+                if role in _INTERACTIVE_UIA_ROLES or (role in ("CustomControl", "ImageControl") and area <= 0.03 * screen_area):
+                    cx = (x1 + x2) // 2
+                    cy = (y1 + y2) // 2
+                    if _is_point_occluded(cx, cy, occluded_rects):
+                        continue
+
+                    label = _extract_uia_label(child, role, w, h)
                     if label:
                         clean_role = role.replace("Control", "").lower() or "control"
                         dedup_key = (x1 // 4, y1 // 4, x2 // 4, y2 // 4, label.lower())
@@ -316,25 +441,101 @@ def _detect_uia_elements(screen_size):
                                 "source": "uia",
                             })
             except Exception:
-                pass
+                continue
 
-            walk(child, depth + 1, max_depth)
+
+def _detect_uia_elements(screen_size):
+    try:
+        import uiautomation as auto
+    except ImportError:
+        return []
+
+    hr = None
+    try:
+        hr = ctypes.windll.ole32.CoInitialize(None)
+    except Exception:
+        pass
+
+    screen_w, screen_h = screen_size
+    screen_area = max(1, screen_w * screen_h)
+    elements = []
+    seen_keys = set()
+    occluded_rects = []
+    scanned_handles = set()
+    deadline = time.perf_counter() + 2.2
 
     try:
         fg = auto.GetForegroundControl()
         if fg:
-            walk(fg, depth=0, max_depth=16)
+            try:
+                fg_pid = getattr(fg, "ProcessId", None)
+                fg_handle = getattr(fg, "NativeWindowHandle", None)
+                fg_rect = fg.BoundingRectangle
+            except Exception:
+                fg_pid, fg_handle, fg_rect = None, None, None
+
+            if fg_pid != _SELF_PID:
+                if fg_handle:
+                    scanned_handles.add(fg_handle)
+                _scan_window_bfs(
+                    fg, screen_w, screen_h, screen_area,
+                    occluded_rects, elements, seen_keys, deadline
+                )
+                if fg_rect:
+                    fx1 = max(0, int(fg_rect.left))
+                    fy1 = max(0, int(fg_rect.top))
+                    fx2 = min(screen_w, int(fg_rect.right))
+                    fy2 = min(screen_h, int(fg_rect.bottom))
+                    if (fx2 - fx1) > 40 and (fy2 - fy1) > 40:
+                        occluded_rects.append((fx1, fy1, fx2, fy2))
 
         if time.perf_counter() <= deadline:
             root = auto.GetRootControl()
             if root:
                 for win in root.GetChildren():
-                    if time.perf_counter() > deadline:
+                    if time.perf_counter() > deadline or len(elements) >= 340:
                         break
                     try:
+                        win_pid = getattr(win, "ProcessId", None)
+                        if win_pid == _SELF_PID:
+                            continue
+                        win_handle = getattr(win, "NativeWindowHandle", None)
+                        if win_handle and win_handle in scanned_handles:
+                            continue
+                        if getattr(win, "IsOffscreen", False):
+                            continue
+
                         cls_name = (win.ClassName or "").strip()
+                        rect = win.BoundingRectangle
+                        if not rect:
+                            continue
+
+                        wx1 = max(0, int(rect.left))
+                        wy1 = max(0, int(rect.top))
+                        wx2 = min(screen_w, int(rect.right))
+                        wy2 = min(screen_h, int(rect.bottom))
+                        ww = wx2 - wx1
+                        wh = wy2 - wy1
+                        if ww < 30 or wh < 25:
+                            continue
+
                         if cls_name in ("Shell_TrayWnd", "NotifyIconOverflowWindow", "#32768"):
-                            walk(win, depth=0, max_depth=6)
+                            _scan_window_bfs(
+                                win, screen_w, screen_h, screen_area,
+                                [], elements, seen_keys, deadline
+                            )
+                            continue
+
+                        if cls_name in ("Progman", "WorkerW"):
+                            continue
+
+                        _scan_window_bfs(
+                            win, screen_w, screen_h, screen_area,
+                            occluded_rects, elements, seen_keys, deadline
+                        )
+                        if win_handle:
+                            scanned_handles.add(win_handle)
+                        occluded_rects.append((wx1, wy1, wx2, wy2))
                     except Exception:
                         continue
     except Exception as e:
@@ -389,11 +590,24 @@ def _merge_elements(text_els, uia_els):
             if inter > 0.45 * min(t_area, u_area) or (center_inside and u_area <= 4.5 * t_area):
                 if u["text"].startswith("Input") and t["text"] and t["text"].lower() not in u["text"].lower():
                     u["text"] = f"{u['text']}: {t['text']}"
+                elif u["text"].startswith("Icon ") and t["text"]:
+                    u["text"] = t["text"]
                 dup = True
                 break
 
         if not dup:
             merged.append(dict(t))
+
+    if len(merged) > _MAX_ELEMENTS:
+        interactive_priority = [
+            e for e in merged
+            if e.get("source") == "uia" and e.get("role") not in ("text", "control")
+        ]
+        others = [
+            e for e in merged
+            if not (e.get("source") == "uia" and e.get("role") not in ("text", "control"))
+        ]
+        merged = (interactive_priority + others)[:_MAX_ELEMENTS]
 
     merged.sort(key=lambda e: (e["bbox"][1] // 18, e["bbox"][0]))
     return merged[:_MAX_ELEMENTS]
@@ -415,7 +629,7 @@ def _load_font(size):
 def _draw_marks(img, elements):
     marked = img.copy().convert("RGB")
     draw = ImageDraw.Draw(marked, "RGBA")
-    font_small = _load_font(12)
+    font_small = _load_font(11)
     w, h = marked.size
     placed_badges = []
     centers = [_element_center(el) for el in elements]
@@ -435,10 +649,10 @@ def _draw_marks(img, elements):
             bw = bbox[2] - bbox[0]
             bh = bbox[3] - bbox[1]
         except Exception:
-            bw, bh = 10, 12
+            bw, bh = 10, 11
 
-        pad_w = bw + 8
-        pad_h = bh + 6
+        pad_w = bw + 6
+        pad_h = bh + 4
 
         candidates = [
             (rx1, max(0, ry1 - pad_h - 1)),
@@ -468,8 +682,8 @@ def _draw_marks(img, elements):
         by2 = min(h, by1 + pad_h)
         placed_badges.append((bx1, by1, bx2, by2))
 
-        draw.rectangle([bx1, by1, bx2, by2], fill=(255, 220, 0, 245), outline=(0, 0, 0, 255), width=1)
-        draw.text((bx1 + 4, by1 + 2), badge, fill=(0, 0, 0, 255), font=font_small)
+        draw.rectangle([bx1, by1, bx2, by2], fill=(255, 220, 0, 225), outline=(0, 0, 0, 255), width=1)
+        draw.text((bx1 + 3, by1 + 1), badge, fill=(0, 0, 0, 255), font=font_small)
 
     return marked
 
@@ -545,7 +759,17 @@ def _resolve_target_coords(gui_cmd, action_name):
 
 
 def _normalize_label(s):
-    return " ".join(str(s or "").strip().lower().split())
+    text = str(s or "").strip().lower()
+    for k, v in _SYMBOL_EQUIVALENTS.items():
+        text = text.replace(k, v)
+    return " ".join(text.split())
+
+
+def _tokenize_label(s):
+    cleaned = s
+    for ch in "[]():,._\"'|":
+        cleaned = cleaned.replace(ch, " ")
+    return [tok for tok in cleaned.split() if tok]
 
 
 def _verify_expected_text(eid, expected_text):
@@ -559,23 +783,20 @@ def _verify_expected_text(eid, expected_text):
     if expected_lower == actual:
         return None
 
+    actual_tokens = _tokenize_label(actual)
+    expected_tokens = _tokenize_label(expected_lower)
+
     if len(expected_lower) <= 2:
-        cleaned_tokens = (
-            actual.replace("[", " ")
-            .replace("]", " ")
-            .replace("(", " ")
-            .replace(")", " ")
-            .replace(":", " ")
-            .split()
-        )
-        if expected_lower in cleaned_tokens:
+        if expected_lower in actual_tokens or (expected_tokens and expected_tokens[0] in actual_tokens):
+            return None
+        if actual.startswith(expected_lower) or actual.endswith(expected_lower):
             return None
     else:
-        if expected_lower in actual:
+        if expected_lower in actual or actual in expected_lower:
             return None
-        if len(actual) >= 4 and len(actual) >= int(len(expected_lower) * 0.6) and actual in expected_lower:
+        if expected_tokens and actual_tokens and set(expected_tokens).issubset(set(actual_tokens)):
             return None
-        if difflib.SequenceMatcher(None, expected_lower, actual).ratio() >= 0.88:
+        if difflib.SequenceMatcher(None, expected_lower, actual).ratio() >= 0.80:
             return None
 
     candidates = []
@@ -583,15 +804,19 @@ def _verify_expected_text(eid, expected_text):
         e_text = _normalize_label(e["text"])
         if not e_text:
             continue
+        e_tokens = _tokenize_label(e_text)
         is_match = False
         if len(expected_lower) <= 2:
-            tokens = e_text.replace("[", " ").replace("]", " ").replace("(", " ").replace(")", " ").split()
-            is_match = (expected_lower == e_text) or (expected_lower in tokens)
+            is_match = (
+                expected_lower == e_text
+                or expected_lower in e_tokens
+                or (expected_tokens and expected_tokens[0] in e_tokens)
+            )
         else:
             is_match = (
                 expected_lower in e_text
                 or e_text in expected_lower
-                or difflib.SequenceMatcher(None, expected_lower, e_text).ratio() >= 0.82
+                or difflib.SequenceMatcher(None, expected_lower, e_text).ratio() >= 0.78
             )
         if is_match:
             cx, cy = _element_center(e)
@@ -608,8 +833,7 @@ def _verify_expected_text(eid, expected_text):
     return (
         f"Observation: Error -> element_id #{eid} actual text is '{el['text'][:50]}' "
         f"but you expected '{expected_text}'. CLICK REJECTED to prevent wrong action."
-        f"{hint} Re-run 'observe' and pick the correct element_id, or verify the "
-        f"'expected_text' matches the exact label shown in the observe list."
+        f"{hint} Pick the correct element_id from the latest 'observe' list."
     )
 
 
@@ -657,9 +881,8 @@ def handle_gui_controller(gui_cmd: dict):
                     f"'right_click_by_id' — always with expected_text.\n"
                     f"4. Only use raw 'click' with x,y coordinates if the target is NOT "
                     f"in the list above (e.g., canvas, image area, custom drawing).\n"
-                    f"5. To type text, use action='type' with 'text' parameter. Optionally "
-                    f"include 'element_id' or 'x','y' to click first. If omitted, text is "
-                    f"typed into the currently focused element.\n"
+                    f"5. To type text, use action='type' with 'text' parameter, optionally "
+                    f"including 'element_id', 'expected_text', 'clear_first', and 'press_enter'.\n"
                     f"6. After every action, call 'observe' again to verify the UI changed "
                     f"correctly.\n"
                     f"7. IMPORTANT: If a click response warns that the screen did NOT "
@@ -682,24 +905,31 @@ def handle_gui_controller(gui_cmd: dict):
                     f"Valid range: 1-{len(_LAST_ELEMENTS)}. Call 'observe' first."
                 )
 
-            expected_text = gui_cmd.get("expected_text", "")
-            if expected_text:
-                verify_err = _verify_expected_text(eid, str(expected_text))
-                if verify_err:
-                    logger.warning(
-                        f"Element verification failed for #{eid}. "
-                        f"Expected '{expected_text}'."
-                    )
-                    return verify_err
+            expected_text = str(gui_cmd.get("expected_text", "") or "").strip()
+            if not expected_text:
+                return (
+                    f"Observation: Error -> 'expected_text' is mandatory when calling {action}. "
+                    f"Element #{eid} has label '{_LAST_ELEMENTS[eid - 1]['text'][:50]}'. "
+                    f"Pass expected_text with the exact label to confirm."
+                )
+
+            verify_err = _verify_expected_text(eid, expected_text)
+            if verify_err:
+                logger.warning(
+                    f"Element verification failed for #{eid}. "
+                    f"Expected '{expected_text}'."
+                )
+                return verify_err
 
             el = _LAST_ELEMENTS[eid - 1]
             x, y = _element_center(el)
 
             logger.info(f"{action} -> element #{eid} '{el['text'][:50]}' at ({x},{y})")
 
+            before_sig = _get_gui_focus_signature()
+            pyautogui.moveTo(x, y, duration=0.10)
+            time.sleep(0.04)
             before_img = _capture_rgb()
-
-            pyautogui.moveTo(x, y, duration=0.12)
 
             if action == "click_by_id":
                 pyautogui.click()
@@ -714,8 +944,9 @@ def handle_gui_controller(gui_cmd: dict):
             time.sleep(sleep_for)
 
             after_img = _capture_rgb()
+            after_sig = _get_gui_focus_signature()
             warning = ""
-            if not _has_screen_changed(before_img, after_img, (x, y)):
+            if not _has_screen_changed(before_img, after_img, (x, y), before_sig, after_sig):
                 logger.warning(
                     f"Click on #{eid} produced no visible change."
                 )
@@ -767,6 +998,7 @@ def handle_gui_controller(gui_cmd: dict):
                         f"Valid range 1-{len(_LAST_ELEMENTS)}. Call 'observe' first."
                     )
 
+            before_sig = _get_gui_focus_signature()
             before_img = _capture_rgb()
             target_xy = None
 
@@ -777,7 +1009,7 @@ def handle_gui_controller(gui_cmd: dict):
                     return "Observation: Error -> 'x' and 'y' must be valid integers."
                 target_xy = (x, y)
                 logger.info(f"Clicking at ({x},{y}) before typing.")
-                pyautogui.moveTo(x, y, duration=0.12)
+                pyautogui.moveTo(x, y, duration=0.10)
                 pyautogui.click()
                 time.sleep(0.18)
             else:
@@ -789,13 +1021,22 @@ def handle_gui_controller(gui_cmd: dict):
                 pyautogui.press("backspace")
                 time.sleep(0.06)
 
-            if text.isascii() and "\n" not in text:
+            needs_clipboard = (
+                not text.isascii()
+                or "\n" in text
+                or "\t" in text
+                or len(text) > 35
+                or any(ch in text for ch in "{}[]()\"'`")
+            )
+
+            if not needs_clipboard:
                 pyautogui.write(text, interval=0.02)
             else:
                 pasted = False
                 try:
                     from tools.SystemTools.clipboard_tool import write_clipboard
                     if write_clipboard(text):
+                        time.sleep(0.04)
                         pyautogui.hotkey("ctrl", "v")
                         pasted = True
                 except Exception:
@@ -813,8 +1054,9 @@ def handle_gui_controller(gui_cmd: dict):
             time.sleep(sleep_for)
 
             after_img = _capture_rgb()
+            after_sig = _get_gui_focus_signature()
             warning = ""
-            if not _has_screen_changed(before_img, after_img, target_xy):
+            if not _has_screen_changed(before_img, after_img, target_xy, before_sig, after_sig):
                 logger.warning("Type action produced no visible change on screen.")
                 warning = (
                     " WARNING: Screen looks IDENTICAL after typing. The text may not have "
@@ -834,9 +1076,17 @@ def handle_gui_controller(gui_cmd: dict):
 
             logger.info(f"Executing {action} at ({x},{y})")
 
-            before_img = _capture_rgb()
+            before_sig = _get_gui_focus_signature()
+            pyautogui.moveTo(x, y, duration=0.12)
 
-            pyautogui.moveTo(x, y, duration=0.15)
+            if action == "hover":
+                _invalidate_cache()
+                if wait_time > 0:
+                    time.sleep(wait_time)
+                return f"Observation: Successfully hovered at ({x},{y})."
+
+            time.sleep(0.04)
+            before_img = _capture_rgb()
 
             if action in ["click", "left_click"]:
                 pyautogui.click()
@@ -844,22 +1094,16 @@ def handle_gui_controller(gui_cmd: dict):
                 pyautogui.rightClick()
             elif action == "double_click":
                 pyautogui.doubleClick()
-            elif action == "hover":
-                pass
 
             _invalidate_cache()
-
-            if action == "hover":
-                if wait_time > 0:
-                    time.sleep(wait_time)
-                return f"Observation: Successfully hovered at ({x},{y})."
 
             sleep_for = wait_time if wait_time > 0 else _DEFAULT_POST_ACTION_WAIT
             time.sleep(sleep_for)
 
             after_img = _capture_rgb()
+            after_sig = _get_gui_focus_signature()
             warning = ""
-            if not _has_screen_changed(before_img, after_img, (x, y)):
+            if not _has_screen_changed(before_img, after_img, (x, y), before_sig, after_sig):
                 logger.warning(
                     f"Raw {action} at ({x},{y}) produced no visible change."
                 )
@@ -879,9 +1123,34 @@ def handle_gui_controller(gui_cmd: dict):
             sy = gui_cmd.get("start_y")
             ex = gui_cmd.get("end_x")
             ey = gui_cmd.get("end_y")
+            start_eid = gui_cmd.get("start_element_id")
+            end_eid = gui_cmd.get("end_element_id")
+
+            if (sx is None or sy is None) and start_eid is not None:
+                try:
+                    s_idx = int(start_eid)
+                    if 1 <= s_idx <= len(_LAST_ELEMENTS):
+                        sx, sy = _element_center(_LAST_ELEMENTS[s_idx - 1])
+                    else:
+                        return f"Observation: Error -> start_element_id {start_eid} out of range (1-{len(_LAST_ELEMENTS)})."
+                except (ValueError, TypeError):
+                    return "Observation: Error -> start_element_id must be an integer."
+
+            if (ex is None or ey is None) and end_eid is not None:
+                try:
+                    e_idx = int(end_eid)
+                    if 1 <= e_idx <= len(_LAST_ELEMENTS):
+                        ex, ey = _element_center(_LAST_ELEMENTS[e_idx - 1])
+                    else:
+                        return f"Observation: Error -> end_element_id {end_eid} out of range (1-{len(_LAST_ELEMENTS)})."
+                except (ValueError, TypeError):
+                    return "Observation: Error -> end_element_id must be an integer."
 
             if None in [sx, sy, ex, ey]:
-                return "Observation: Error -> drag_and_drop requires start_x, start_y, end_x, end_y."
+                return (
+                    "Observation: Error -> drag_and_drop requires either "
+                    "(start_element_id and end_element_id) OR (start_x, start_y, end_x, end_y)."
+                )
 
             try:
                 sx, sy, ex, ey = int(sx), int(sy), int(ex), int(ey)
@@ -909,6 +1178,7 @@ def handle_gui_controller(gui_cmd: dict):
 
             logger.info(f"Pressing key: {key}")
 
+            before_sig = _get_gui_focus_signature()
             before_img = _capture_rgb()
 
             pyautogui.press(str(key))
@@ -919,8 +1189,9 @@ def handle_gui_controller(gui_cmd: dict):
             time.sleep(sleep_for)
 
             after_img = _capture_rgb()
+            after_sig = _get_gui_focus_signature()
             warning = ""
-            if not _has_screen_changed(before_img, after_img):
+            if not _has_screen_changed(before_img, after_img, None, before_sig, after_sig):
                 logger.info(f"Key '{key}' produced no visible screen change.")
                 warning = (
                     f" NOTE: Screen looks IDENTICAL after pressing '{key}'. If you "
@@ -941,6 +1212,7 @@ def handle_gui_controller(gui_cmd: dict):
 
             logger.info(f"Pressing hotkey: {clean_keys}")
 
+            before_sig = _get_gui_focus_signature()
             before_img = _capture_rgb()
 
             pyautogui.hotkey(*clean_keys)
@@ -951,8 +1223,9 @@ def handle_gui_controller(gui_cmd: dict):
             time.sleep(sleep_for)
 
             after_img = _capture_rgb()
+            after_sig = _get_gui_focus_signature()
             warning = ""
-            if not _has_screen_changed(before_img, after_img):
+            if not _has_screen_changed(before_img, after_img, None, before_sig, after_sig):
                 logger.info(f"Hotkey {clean_keys} produced no visible screen change.")
                 warning = (
                     f" NOTE: Screen looks IDENTICAL after hotkey {clean_keys}. If a UI change "
