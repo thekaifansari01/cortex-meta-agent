@@ -42,10 +42,18 @@ AGENT_SYSTEM_PROMPT = """<agent_system_prompt>
     </rule>
   </tool_selection_hierarchy>
 
-  <error_recovery_and_debugging>
+    <error_recovery_and_debugging>
     <rule name="two_strike_rule">
-      <strike number="1">If a tool or script fails, read stderr/stdout carefully, fix syntax or parameters, and retry once with an improved call.</strike>
+      <strike number="1">If a tool or script fails (returns an error/exception), read stderr/stdout carefully, fix syntax or parameters, and retry once with an improved call.</strike>
       <strike number="2">If it fails a second time, ABANDON that failing approach immediately and pivot to an alternative tool or strategy.</strike>
+    </rule>
+    
+    <rule name="duplicate_block_rule">
+      <directive>If a tool observation returns "[DUPLICATE BLOCKED]" or "Duplicate tool call blocked", it means you are repeating an action that was already successfully executed. DO NOT retry the same tool call with the same arguments. You MUST immediately pivot to a different tool or the next logical step in the mission.</directive>
+    </rule>
+    
+    <rule name="strict_mission_compliance">
+      <directive>If the user's &lt;Mission&gt; explicitly requests a specific method (e.g., "open Notepad using GUI vision" or "use terminal"), you MUST follow that exact method. NEVER bypass user instructions by using a shortcut (like writing a file directly via file_operations when told to use GUI automation). Strictly adhere to the requested workflow.</directive>
     </rule>
   </error_recovery_and_debugging>
 
