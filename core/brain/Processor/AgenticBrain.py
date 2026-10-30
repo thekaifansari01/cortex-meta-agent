@@ -1,4 +1,5 @@
 import json
+import os
 import re
 import time
 import hashlib
@@ -906,7 +907,9 @@ If the <Mission> is fully complete, call 'complete_task'.
                             f_act = value.get("action", "File operation")
                             f_target = value.get("file_path") or ""
                             if f_target:
-                                f_target = f" ({os.path.basename(str(f_target))})" if "os" in globals() else f" ({str(f_target).replace('\\', '/').split('/')[-1]})"
+                                _normalized = str(f_target).replace("\\", "/")
+                                _basename = _normalized.rsplit("/", 1)[-1]
+                                f_target = f" ({_basename})"
                             current_detail = f"{f_act}{f_target}"
                         elif key == "gui_controller" and isinstance(value, dict):
                             gui_action = value.get("action", "")
