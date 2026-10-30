@@ -1,4 +1,5 @@
 import os
+import re
 import json
 import base64
 import py_compile
@@ -40,12 +41,26 @@ class JarvisFileEditor:
     def _normalize_block(self, block):
         if not block:
             return block
-        lines = block.split('\n')
+        lines = block.replace("\r\n", "\n").replace("\r", "\n").split("\n")
         while lines and not lines[0].strip():
             lines.pop(0)
         while lines and not lines[-1].strip():
             lines.pop()
-        return '\n'.join(lines)
+        return "\n".join(lines)
+
+    def _Strip_line_numbers_if_copied(self, block):
+        if not block:
+            return block
+        lines = block.split("\n")
+        pattern = re.compile(r"^\s*\d+\s*\|\s?(.*)$")
+        matched = [pattern.match(line) for line in lines if line.strip()]
+        if matched and all(m is not None for m in matched):
+            cleaned = []
+            for line in lines:
+                m = pattern.match(line)
+                cleaned.append(m.group(1) if m else line)
+            return "\n".join(cleaned)
+        return block
 
     def _truncate_text(self, text, max_chars, label="Content"):
         if len(text) <= max_chars:
@@ -181,8 +196,11 @@ class JarvisFileEditor:
             if not os.path.exists(file_path):
                 return f"[ERROR] File not found: '{file_path}'"
 
-            norm_search = self._normalize_block(search_block)
-            norm_replace = self._normalize_block(replace_block)
+            clean_search_input = self._Strip_line_numbers_if_copied(search_block or "")
+            clean_replace_input = self._Strip_line_numbers_if_copied(replace_block or "")
+
+            norm_search = self._normalize_block(clean_search_input)
+            norm_replace = self._normalize_block(clean_replace_input)
             if not norm_search:
                 return "[ERROR] Search block cannot be empty."
 
@@ -190,31 +208,66 @@ class JarvisFileEditor:
 
             matches = content.count(norm_search)
             if matches == 0:
-                alt = norm_search.rstrip('\n')
+                alt = norm_search.rstrip("\n")
                 if alt and content.count(alt) > 0:
                     matches = content.count(alt)
                     norm_search = alt
                 else:
-                    raw_norm = search_block.replace("\r\n", "\n").replace("\r", "\n")
+                    raw_norm = clean_search_input.replace("\r\n", "\n").replace("\r", "\n")
                     if raw_norm != norm_search and content.count(raw_norm) > 0:
                         matches = content.count(raw_norm)
                         norm_search = raw_norm
                     else:
-                        return f"[ERROR] Search block not found in '{file_path}'. Ensure indentation and spacing match exactly."
+                        content_lines = content.split("\n")
+                        search_lines = norm_search.split("\n")
+                        s_len = len(search_lines)
+                        stripped_search = [ln.rstrip() for ln in search_lines]
+                        found_indices = []
+                        for i in range(len(content_lines) - s_len + 1):
+                            window = [ln.rstrip() for ln in content_lines[i:i + s_len]]
+                            if window == stripped_search:
+                                found_indices.append(i)
+                        if len(found_indices) == 1:
+                            idx = found_indices[0]
+                            norm_search = "\n".join(content_lines[idx:idx + s_len])
+                            matches = 1
+                        elif len(found_indices) > 1:
+                            return f"[ERROR] Search block found {len(found_indices)} times in '{file_path}'. Please provide a larger, more unique search block."
+                        else:
+                            return f"[ERROR] Search block not found in '{file_path}'. Ensure indentation and lines match the current file content."
+
             if matches == 0:
                 return f"[ERROR] Search block not found in '{file_path}'."
             if matches > 1:
                 return f"[ERROR] Search block found {matches} times in '{file_path}'. Please provide a larger, more unique search block."
 
-            new_content = content.replace(norm_search, norm_replace)
+            replace_pos = content.find(norm_search)
+            start_line_num = content[:replace_pos].count("\n") + 1
+            new_content = content.replace(norm_search, norm_replace, 1)
             self._write_preserve_newline(file_path, new_content, use_crlf)
+
+            new_lines = new_content.split("\n")
+            rep_line_count = norm_replace.count("\n") + 1
+            ctx_start = max(0, start_line_num - 3)
+            ctx_end = min(len(new_lines), start_line_num - 1 + rep_line_count + 2)
+            preview_lines = [
+                f"{idx + 1}: {new_lines[idx]}"
+                for idx in range(ctx_start, ctx_end)
+            ]
+            preview_snippet = "\n".join(preview_lines)
 
             syntax_status = self._validate_syntax(file_path)
             if "CRITICAL" in syntax_status:
                 logger.error(f"Syntax error after replace in {file_path}: {syntax_status}")
-                return f"[ERROR] Block replaced in '{file_path}', but broke syntax!{syntax_status}"
+                return (
+                    f"[ERROR] Block replaced in '{file_path}' around line {start_line_num}, "
+                    f"but broke syntax!{syntax_status}\n\nUpdated Region:\n{preview_snippet}"
+                )
             logger.info(f"✅ Block replaced successfully in {file_path}")
-            return f"[SUCCESS] Block replaced cleanly in '{file_path}'.{syntax_status}"
+            return (
+                f"[SUCCESS] Block replaced cleanly in '{file_path}' (around line {start_line_num})."
+                f"{syntax_status}\n\nUpdated Region:\n{preview_snippet}"
+            )
         except Exception as e:
             logger.error(f"Replace block error: {e}")
             return f"[ERROR] Failed to replace block in '{file_path}': {e}"

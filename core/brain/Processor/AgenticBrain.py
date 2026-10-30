@@ -1,6 +1,7 @@
 import json
 import re
 import time
+import hashlib
 import tiktoken
 from typing import Dict
 from core.brain.config import (
@@ -28,6 +29,24 @@ _REPEATABLE_GUI_ACTIONS = {
     "press_key",
     "hotkey",
 }
+
+
+def _make_action_fingerprint(tool_name: str, tool_args) -> str:
+    if isinstance(tool_args, dict):
+        try:
+            canonical = json.dumps(tool_args, sort_keys=True, ensure_ascii=False)
+        except Exception:
+            canonical = str(tool_args)
+        digest = hashlib.sha256(canonical.encode("utf-8", errors="ignore")).hexdigest()[:16]
+        act = tool_args.get("action") or tool_args.get("command") or ""
+        fp_path = tool_args.get("file_path") or ""
+        if fp_path:
+            fp_path = str(fp_path).replace("\\", "/")[-40:]
+        label = f"{act}:{fp_path}" if fp_path else str(act)[:40]
+        return f"{tool_name}:{label}:{digest}"
+    raw = str(tool_args)
+    digest = hashlib.sha256(raw.encode("utf-8", errors="ignore")).hexdigest()[:16]
+    return f"{tool_name}:{digest}"
 
 
 def make_result(response, **kwargs):
@@ -196,7 +215,7 @@ def update_confirmed_facts(
         )
     elif action_key == "file_operations":
         facts_ledger[f"File Op ({action_detail[:30]})"] = (
-            obs_str[:100].replace("\n", " ").strip()
+            obs_str[:120].replace("\n", " ").strip()
         )
     elif action_key == "run_python_code":
         facts_ledger["Last Python Output"] = obs_str[:150].replace("\n", " ").strip()
@@ -452,6 +471,7 @@ If the <Mission> is fully complete, call 'complete_task'.
                 )
 
             ai_response = {}
+            extra_same_tool_calls = []
             max_api_retries = 10
             provider_switched = False
             pending_image_payloads_snapshot = list(pending_image_payloads)
@@ -599,18 +619,29 @@ If the <Mission> is fully complete, call 'complete_task'.
                         thought_text = ""
                     thought_text = thought_text.strip() or "Analyzing context..."
 
+                    ai_response = {}
+                    extra_same_tool_calls = []
                     tool_calls = response.get("tool_calls", [])
                     if tool_calls:
                         for tc in tool_calls:
                             func_name = tc["function"]["name"]
                             func_args = tc["function"]["arguments"]
+                            if isinstance(func_args, str):
+                                try:
+                                    func_args = json.loads(func_args)
+                                except Exception:
+                                    pass
                             if func_name == "complete_task":
                                 ai_response["is_task_complete"] = True
-                                ai_response["response"] = func_args.get(
-                                    "response", "Task completed sir."
+                                ai_response["response"] = (
+                                    func_args.get("response", "Task completed sir.")
+                                    if isinstance(func_args, dict)
+                                    else "Task completed sir."
                                 )
                             elif func_name not in ai_response:
                                 ai_response[func_name] = func_args
+                            else:
+                                extra_same_tool_calls.append((func_name, func_args))
 
                     ai_response["thought"] = thought_text
 
@@ -679,6 +710,7 @@ If the <Mission> is fully complete, call 'complete_task'.
                         ai_response["_truncation_reasons"] = truncation_reasons
                         ai_response.pop("is_task_complete", None)
                         ai_response.pop("response", None)
+                        extra_same_tool_calls = []
                         for k in list(ai_response.keys()):
                             if k not in ("thought", "_truncation_detected", "_truncation_reasons"):
                                 ai_response.pop(k, None)
@@ -871,7 +903,11 @@ If the <Mission> is fully complete, call 'complete_task'.
                         elif key == "vision" and isinstance(value, dict):
                             current_detail = value.get("query", "Inspecting media")
                         elif key == "file_operations" and isinstance(value, dict):
-                            current_detail = value.get("action", "File operation")
+                            f_act = value.get("action", "File operation")
+                            f_target = value.get("file_path") or ""
+                            if f_target:
+                                f_target = f" ({os.path.basename(str(f_target))})" if "os" in globals() else f" ({str(f_target).replace('\\', '/').split('/')[-1]})"
+                            current_detail = f"{f_act}{f_target}"
                         elif key == "gui_controller" and isinstance(value, dict):
                             gui_action = value.get("action", "")
                             if gui_action == "observe":
@@ -1048,13 +1084,16 @@ ACT IMMEDIATELY — no further deliberation.</Result>
                     gui_act = str(t_val.get("action", "")).strip()
                     if gui_act in _REPEATABLE_GUI_ACTIONS:
                         continue
-                    fp = f"{t_key}:{str(t_val)[:120]}"
+                    fp = _make_action_fingerprint(t_key, t_val)
                     if f"{fp} -> [NO_SCREEN_CHANGE - DO NOT REPEAT]" in completed_actions:
                         duplicate_tool = t_key
                         break
                     continue
 
-                fp = f"{t_key}:{str(t_val)[:100]}"
+                if t_key in ("execute_terminal_command", "run_python_code"):
+                    continue
+
+                fp = _make_action_fingerprint(t_key, t_val)
                 if (f"{fp} -> [SUCCESS]" in completed_actions or
                     f"{fp} -> [SUCCESS - USER EDITED CONTENT IN UI AND SENT, DO NOT RESEND]" in completed_actions):
                     duplicate_tool = t_key
@@ -1062,7 +1101,7 @@ ACT IMMEDIATELY — no further deliberation.</Result>
 
             observation = None
             if duplicate_tool:
-                observation = f"Observation: [ERROR] Duplicate action blocked. The tool '{duplicate_tool}' was already executed with identical parameters without further effect. Do NOT retry the same action. Call 'observe' if using GUI, choose a different element/approach, or call 'complete_task' if finished."
+                observation = f"Observation: [ERROR] Duplicate action blocked. The tool '{duplicate_tool}' was already executed with identical parameters without any intermediate file/state modification. Do NOT retry the exact same call. Proceed to the next step or call 'complete_task' if finished."
                 had_system_failure = True
                 logger.warning(f"⚠️ Duplicate tool call blocked: {duplicate_tool}")
                 if not silent:
@@ -1124,6 +1163,15 @@ ACT IMMEDIATELY — no further deliberation.</Result>
                             observation = execute_tools_parallel(ai_response)
                             start_time += consume_confirmation_wait_time()
 
+                            if extra_same_tool_calls and not isinstance(observation, dict):
+                                extra_obs_list = [str(observation)]
+                                for ext_name, ext_args in extra_same_tool_calls:
+                                    if isinstance(ext_args, dict):
+                                        ext_res = execute_tools_parallel({ext_name: ext_args})
+                                        start_time += consume_confirmation_wait_time()
+                                        extra_obs_list.append(str(ext_res))
+                                observation = "\n\n".join(extra_obs_list)
+
                         if observation:
                             if isinstance(observation, dict) and observation.get("type") == "image_payload":
                                 for img in observation.get("data", []):
@@ -1150,10 +1198,9 @@ ACT IMMEDIATELY — no further deliberation.</Result>
                                     t_val = ai_response.get(t_key, {})
                                     if not isinstance(t_val, dict):
                                         t_val = {}
-                                    action_fingerprint = f"{t_key}:{str(t_val)[:100]}"
+                                    action_fingerprint = _make_action_fingerprint(t_key, t_val)
                                     if t_key == "gui_controller":
                                         gui_act = str(t_val.get("action", "")).strip()
-                                        gui_fp = f"{t_key}:{str(t_val)[:120]}"
                                         if gui_act == "observe":
                                             scratchpad = _collapse_stale_gui_observations(scratchpad)
                                             completed_actions = {
@@ -1162,13 +1209,24 @@ ACT IMMEDIATELY — no further deliberation.</Result>
                                             }
                                             update_confirmed_facts(confirmed_facts, t_key, action_detail, observation)
                                         elif is_gui_no_change:
-                                            completed_actions.add(f"{gui_fp} -> [NO_SCREEN_CHANGE - DO NOT REPEAT]")
+                                            completed_actions.add(f"{action_fingerprint} -> [NO_SCREEN_CHANGE - DO NOT REPEAT]")
                                         else:
                                             completed_actions = {
                                                 item for item in completed_actions
                                                 if not item.endswith("[NO_SCREEN_CHANGE - DO NOT REPEAT]")
                                             }
                                             update_confirmed_facts(confirmed_facts, t_key, action_detail, observation)
+                                    elif t_key == "file_operations":
+                                        f_act = str(t_val.get("action", "")).strip()
+                                        if f_act in ("replace_block", "create"):
+                                            completed_actions = {
+                                                item for item in completed_actions
+                                                if not item.startswith("file_operations:view:")
+                                            }
+                                        completed_actions.add(f"{action_fingerprint} -> [SUCCESS]")
+                                        update_confirmed_facts(confirmed_facts, t_key, action_detail, observation)
+                                    elif t_key in ("execute_terminal_command", "run_python_code"):
+                                        update_confirmed_facts(confirmed_facts, t_key, action_detail, observation)
                                     elif is_user_cancelled:
                                         completed_actions.add(f"{action_fingerprint} -> [CANCELLED BY USER - DO NOT RETRY]")
                                         confirmed_facts[f"User Cancelled ({t_key})"] = "User explicitly cancelled sending this message from the UI preview. Do NOT retry."
@@ -1290,7 +1348,7 @@ ACT IMMEDIATELY — no further deliberation.</Result>
                         break
                 else:
                     had_system_failure = True
-                    action_fingerprint = f"{action_key}:{str(ai_response.get(action_key, ''))[:100]}"
+                    action_fingerprint = _make_action_fingerprint(action_key, ai_response.get(action_key, {}))
                     completed_actions.add(
                         f"{action_fingerprint} -> [FAILED: After {retry_limit} retries]"
                     )
