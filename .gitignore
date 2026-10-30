@@ -10,3 +10,4 @@ tools/Messanger/whatsapp/BaileysServer/package.json
 tools/Messanger/whatsapp/BaileysServer/qr_code.png
 *.log
 Data/SessionCookies/
+.cortex.lock
