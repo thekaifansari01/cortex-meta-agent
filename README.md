@@ -12,15 +12,17 @@
 ## 🏆 Built for the Meta Global AI Developer Hackathon
 This project was developed for the hackathon (Oct 26 – Nov 4, 2026) targeting the **"Build for Your World"** and **"Push the Frontier"** problem statements.
 
-### 🚀 What Was Built During the Hackathon (New Work)
-I used my prior open-source OS automation framework as a foundational base. However, to meet the hackathon criteria, I completely overhauled the AI architecture and built the following core components **from scratch during the 10-day event**:
+### 🚀 Hackathon Scope: What Was Built (Oct 26 – Nov 4)
 
-*   **Meta Muse Spark Integration:** Built a new `BasetenProvider` module from scratch to handle the `meta-models/muse-spark-open-1026` model, adapting the agentic loop to utilize Muse Spark's native tool-calling and reasoning capabilities.
-*   **Advanced Truncation Self-Correction:** Engineered a custom parser that detects broken JSON mid-stream from the LLM and forces the agent to retry with smaller payloads (built during the hackathon).
-*   **Real-time Mid-Execution Correction:** Implemented a ZeroMQ-based live feedback loop allowing users to interrupt and redirect the agent mid-task (built during the hackathon).
-*   **GUI Grounding (OCR + UIA):** Built a new Set-of-Mark (SoM) visual grounding system that maps screen elements to precise bounding boxes (built during the hackathon).
-*   **ZeroMQ IPC Architecture:** Decoupled the heavy AI loop from the PyQt5 UI for zero-latency, asynchronous UI updates (built during the hackathon).
----
+For this hackathon, I architected and engineered the **Cortex Meta-Engine**. While I utilized my existing OS-level tool wrappers as a foundational shell, the entire AI cognitive architecture, vision system, and user interface were built from scratch during this 10-day event. 
+
+Here is exactly what was newly developed for this submission:
+
+*   **Meta Muse Spark Integration (`BasetenProvider`):** Engineered a completely new LLM provider module from scratch to interface with Meta's `meta-models/muse-spark-open-1026`. The entire agentic loop was rewritten to leverage Muse Spark's native tool-calling and advanced reasoning capabilities.
+*   **Autonomous Truncation Self-Correction:** Developed a novel stream-parser that detects broken JSON or truncated LLM outputs mid-stream. It actively intercepts the failure, discards the partial payload, and forces the agent to retry with a reduced payload size.
+*   **Real-time Mid-Execution Interruption:** Built an asynchronous ZeroMQ-based live-feedback pipeline. This allows the user to inject new instructions via a global hotkey while the agent is executing a task, forcing the agent to instantly adapt its plan mid-flight.
+*   **GUI Grounding & Vision System (OCR + UIA):** Built a new Set-of-Mark (SoM) visual grounding architecture from the ground up. It merges Windows UIA trees with RapidOCR to overlay numbered bounding boxes, allowing the agent to accurately "see" and click UI elements.
+*   **Decoupled UI Architecture:** Replaced legacy synchronous UI blocks with a high-performance ZeroMQ IPC (Inter-Process Communication) layer, ensuring the heavy agentic loop runs independently for zero-latency UI updates.
 
 ## 💡 Why Cortex? (Impact)
 Current AI assistants (ChatGPT, Claude web) are trapped inside browsers. They can't open your apps, organize your files, send an actual WhatsApp message, or interact with your OS. 
