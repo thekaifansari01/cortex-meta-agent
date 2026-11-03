@@ -149,7 +149,7 @@ Here is a glimpse of the Cortex UI in action:
   <i>Typing Popup: Editable draft before sending emails or messages.</i>
 </p>
 
-🎥 **Watch the 3-Minute Demo Video Here:** *[Insert YouTube/Loom Link Here]*
+🎥 **Watch the 3-Minute Demo Video Here:** *[https://youtu.be/cRYxe3yrnvU?is=LRcMzUrdix54k3Sh]*
 
 ---
 
